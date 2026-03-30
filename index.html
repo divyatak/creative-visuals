@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Interactive Visuals — Hand Tracking</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #000; overflow: hidden; cursor: none; }
+    canvas { display: block; }
+    video { display: none; }
+    #info {
+      position: fixed; bottom: 20px; left: 20px;
+      color: rgba(255,255,255,0.5); font: 13px monospace;
+      pointer-events: none; z-index: 10;
+      line-height: 1.6;
+    }
+    #mode-label {
+      position: fixed; top: 30px; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,0); font: 24px monospace; font-weight: bold;
+      pointer-events: none; z-index: 10;
+      transition: color 0.3s;
+    }
+    #mode-label.show { color: rgba(255,255,255,0.7); }
+  </style>
+</head>
+<body>
+  <div id="mode-label"></div>
+  <div id="info">starting camera...</div>
+  <video id="video" playsinline></video>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <script type="module">
+    // Use the newer MediaPipe vision bundle — much more reliable loading
+    import { HandLandmarker, FilesetResolver } from
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
+
+    // ──────────────────────────────────────
+    // Hand tracking state
+    // ──────────────────────────────────────
+    let handLandmarker = null;
+    let fingertips = [];
+    let palmCenter = null;
+    let isOpenPalm = false;
+    let wasOpenPalm = false;
+    let openPalmStart = 0;
+    let twoHandsActive = false;
+    let leftPalm = null, rightPalm = null;
+    let leftTips = [], rightTips = [];
+    let videoReady = false;
+    let videoEl;
+    let lastDetect = 0;
+
+    // ──────────────────────────────────────
+    // Visual state
+    // ──────────────────────────────────────
+    let particles = [];
+    const MAX_PARTICLES = 1000;
+    let mode = 0;
+    const MODES = 2;
+    const MODE_NAMES = ['Flow Mirror', 'Wave Distort'];
+    let intensity = 1.2;
+    let camPixels = null;
+    let flowField = [];
+    let cols, rows;
+    const gridScale = 16;
+    let time = 0;
+    let modeShowTimer = 0;
+    let fingerTrails = [[], [], [], [], [], [], [], [], [], []];
+
+    // ──────────────────────────────────────
+    // Start everything
+    // ──────────────────────────────────────
+    async function startApp() {
+      // 1. Start webcam
+      videoEl = document.getElementById('video');
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: 'user' }
+        });
+        videoEl.srcObject = stream;
+        await videoEl.play();
+        videoReady = true;
+        document.getElementById('info').textContent = 'camera ready · loading hand model...';
+      } catch (e) {
+        document.getElementById('info').textContent = 'camera denied — mouse fallback active';
+        console.error(e);
+      }
+
+      // 2. Load hand landmarker
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+        );
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          numHands: 2,
+          minHandDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        document.getElementById('info').textContent =
+          `mode: ${MODE_NAMES[mode]} · open palm to switch · scroll for intensity`;
+        console.log('Hand landmarker loaded!');
+      } catch (e) {
+        console.error('Hand model failed:', e);
+        document.getElementById('info').textContent = 'hand model failed — mouse fallback active';
+      }
+    }
+
+    startApp();
+
+    // ──────────────────────────────────────
+    // Detect hands
+    // ──────────────────────────────────────
+    function detectHands() {
+      if (!handLandmarker || !videoReady) return;
+      let now = performance.now();
+      if (now - lastDetect < 60) return; // ~16fps for detection
+      lastDetect = now;
+
+      let results;
+      try {
+        results = handLandmarker.detectForVideo(videoEl, now);
+      } catch (e) { return; }
+
+      fingertips = [];
+      palmCenter = null;
+      twoHandsActive = false;
+      leftPalm = null; rightPalm = null;
+      leftTips = []; rightTips = [];
+
+      if (results.landmarks && results.landmarks.length > 0) {
+        const tipIdx = [4, 8, 12, 16, 20];
+        const mcpIdx = [2, 6, 10, 14, 18];
+
+        results.landmarks.forEach((lms, handIdx) => {
+          let tips = [];
+          tipIdx.forEach(ti => {
+            let sx = (1 - lms[ti].x) * width;
+            let sy = lms[ti].y * height;
+            fingertips.push({ x: sx, y: sy });
+            tips.push({ x: sx, y: sy });
+          });
+
+          let px = 0, py = 0;
+          [0, 5, 9, 13, 17].forEach(i => { px += lms[i].x; py += lms[i].y; });
+          px = (1 - px / 5) * width;
+          py = (py / 5) * height;
+          let palm = { x: px, y: py };
+
+          if (handIdx === 0) { leftPalm = palm; leftTips = tips; }
+          if (handIdx === 1) { rightPalm = palm; rightTips = tips; }
+          if (!palmCenter) palmCenter = palm;
+
+          // open palm detection
+          let open = 0;
+          tipIdx.forEach((ti, i) => {
+            let d = Math.hypot(lms[ti].x - lms[mcpIdx[i]].x, lms[ti].y - lms[mcpIdx[i]].y);
+            if (d > 0.06) open++;
+          });
+
+          if (open >= 4) {
+            if (!isOpenPalm) { isOpenPalm = true; openPalmStart = millis(); }
+          } else {
+            isOpenPalm = false;
+          }
+        });
+
+        if (results.landmarks.length >= 2) twoHandsActive = true;
+      } else {
+        isOpenPalm = false;
+      }
+    }
+
+    // ──────────────────────────────────────
+    // Grab webcam pixels
+    // ──────────────────────────────────────
+    let offCanvas, offCtx;
+    function grabPixels() {
+      if (!videoReady) return;
+      if (!offCanvas) {
+        offCanvas = document.createElement('canvas');
+        offCanvas.width = 160;
+        offCanvas.height = 120;
+        offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+      }
+      offCtx.drawImage(videoEl, 0, 0, 160, 120);
+      camPixels = offCtx.getImageData(0, 0, 160, 120).data;
+    }
+
+    // ──────────────────────────────────────
+    // p5.js setup
+    // ──────────────────────────────────────
+    window.setup = function () {
+      createCanvas(windowWidth, windowHeight);
+      pixelDensity(1);
+      cols = floor(width / gridScale);
+      rows = floor(height / gridScale);
+      for (let i = 0; i < MAX_PARTICLES; i++) particles.push(new Particle());
+      colorMode(HSB, 360, 100, 100, 100);
+    };
+
+    // ──────────────────────────────────────
+    // p5.js draw
+    // ──────────────────────────────────────
+    window.draw = function () {
+      time += 0.01;
+
+      detectHands();
+      grabPixels();
+
+      // open palm switch (hold 0.8s)
+      if (isOpenPalm && millis() - openPalmStart > 800 && !wasOpenPalm) {
+        mode = (mode + 1) % MODES;
+        wasOpenPalm = true;
+        modeShowTimer = 90;
+        let label = document.getElementById('mode-label');
+        label.textContent = MODE_NAMES[mode];
+        label.classList.add('show');
+        document.getElementById('info').textContent =
+          `mode: ${MODE_NAMES[mode]} · open palm to switch · scroll for intensity`;
+      }
+      if (!isOpenPalm) wasOpenPalm = false;
+      if (modeShowTimer > 0) {
+        modeShowTimer--;
+        if (modeShowTimer === 0) document.getElementById('mode-label').classList.remove('show');
+      }
+
+      // particle lifecycle — decay and regen
+      for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].life -= particles[i].decay;
+        if (particles[i].life <= 0) {
+          particles[i] = new Particle(); // respawn fresh
+        }
+      }
+
+      updateFingerTrails();
+      background(0, 0, 0, mode === 0 ? 12 : 25);
+
+      if (camPixels) {
+        if (mode === 0) drawModeFlowMirror();
+        else drawModeWaveDistort();
+      }
+
+      drawFingerTrails();
+      if (twoHandsActive) drawHandConnections();
+      drawFingertipGlow();
+    };
+
+    // ──────────────────────────────────────
+    // Finger trails
+    // ──────────────────────────────────────
+    function updateFingerTrails() {
+      for (let i = 0; i < 10; i++) {
+        if (i < fingertips.length) {
+          fingerTrails[i].push({ x: fingertips[i].x, y: fingertips[i].y });
+          if (fingerTrails[i].length > 40) fingerTrails[i].shift();
+        } else {
+          if (fingerTrails[i].length > 0) fingerTrails[i].shift();
+        }
+      }
+    }
+
+    function drawFingerTrails() {
+      noFill();
+      for (let i = 0; i < 10; i++) {
+        let trail = fingerTrails[i];
+        if (trail.length < 2) continue;
+        for (let j = 1; j < trail.length; j++) {
+          let alpha = map(j, 0, trail.length, 5, 60);
+          let weight = map(j, 0, trail.length, 0.5, 3) * intensity;
+          let hue = (i * 36 + time * 80) % 360;
+          stroke(hue, 70, 95, alpha);
+          strokeWeight(weight);
+          line(trail[j - 1].x, trail[j - 1].y, trail[j].x, trail[j].y);
+        }
+      }
+    }
+
+    // ──────────────────────────────────────
+    // Two-hand connections
+    // ──────────────────────────────────────
+    function drawHandConnections() {
+      if (!leftPalm || !rightPalm) return;
+      for (let i = 0; i < Math.min(leftTips.length, rightTips.length); i++) {
+        let l = leftTips[i], r = rightTips[i];
+        let d = dist(l.x, l.y, r.x, r.y);
+        let alpha = map(d, 0, width * 0.6, 50, 0);
+        if (alpha <= 0) continue;
+        let hue = (i * 72 + time * 60) % 360;
+        stroke(hue, 60, 95, alpha);
+        strokeWeight(map(d, 0, width * 0.5, 2.5, 0.5) * intensity);
+        line(l.x, l.y, r.x, r.y);
+        let mx = (l.x + r.x) / 2, my = (l.y + r.y) / 2;
+        noStroke();
+        fill(hue, 50, 100, alpha * 0.6);
+        ellipse(mx, my, (sin(time * 5 + i) * 3 + 5) * intensity);
+      }
+      let pd = dist(leftPalm.x, leftPalm.y, rightPalm.x, rightPalm.y);
+      let a = map(pd, 0, width * 0.5, 30, 0);
+      if (a > 0) {
+        noFill();
+        stroke((time * 40) % 360, 40, 100, a);
+        strokeWeight(1.5);
+        let mx = (leftPalm.x + rightPalm.x) / 2, my = (leftPalm.y + rightPalm.y) / 2;
+        ellipse(mx, my + sin(time * 3) * 10, pd * 0.4, pd * 0.3);
+      }
+    }
+
+    // ──────────────────────────────────────
+    // MODE 0: Flow Mirror
+    // ──────────────────────────────────────
+    function drawModeFlowMirror() {
+      let px = camPixels;
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+          let camX = floor(map(x, 0, cols, 0, 160));
+          let camY = floor(map(y, 0, rows, 0, 120));
+          let idx = (camY * 160 + camX) * 4;
+          let bright = ((px[idx] || 0) + (px[idx + 1] || 0) + (px[idx + 2] || 0)) / 3;
+          flowField[y * cols + x] = map(bright, 0, 255, 0, TWO_PI * 2) + time;
+        }
+      }
+
+      let interactors = fingertips.length > 0 ? fingertips : [{ x: mouseX, y: mouseY }];
+
+      for (let p of particles) {
+        let col = constrain(floor(p.pos.x / gridScale), 0, cols - 1);
+        let row = constrain(floor(p.pos.y / gridScale), 0, rows - 1);
+        let force = p5.Vector.fromAngle(flowField[row * cols + col]);
+        force.mult(0.3 * intensity);
+        p.applyForce(force);
+
+        let closestDist = 9999;
+        for (let ft of interactors) {
+          let dir = p5.Vector.sub(createVector(ft.x, ft.y), p.pos);
+          let d = dir.mag();
+          if (d < closestDist) closestDist = d;
+          if (d < 200) {
+            dir.normalize().mult(map(d, 0, 200, 3, 0) * intensity);
+            p.applyForce(dir);
+            // boost life when near a fingertip
+            p.life = min(p.life + 2, 255);
+          }
+        }
+
+        let cx = constrain(floor(map(p.pos.x, 0, width, 159, 0)), 0, 159);
+        let cy = constrain(floor(map(p.pos.y, 0, height, 0, 119)), 0, 119);
+        let idx = (cy * 160 + cx) * 4;
+
+        p.update();
+        p.edges();
+
+        let alpha = map(p.life, 0, 255, 0, 180);
+        let sw = map(min(closestDist, 200), 0, 200, 3.5, 0.8) * intensity;
+        sw *= map(p.life, 0, 255, 0.3, 1); // thinner as they die
+        stroke(px[idx] || 128, px[idx + 1] || 128, px[idx + 2] || 128, alpha);
+        strokeWeight(sw);
+        point(p.pos.x, p.pos.y);
+      }
+    }
+
+    // ──────────────────────────────────────
+    // MODE 1: Wave Distort
+    // ──────────────────────────────────────
+    function drawModeWaveDistort() {
+      let px = camPixels;
+      let step = 4;
+      let interactors = fingertips.length > 0 ? fingertips : [{ x: mouseX, y: mouseY }];
+
+      for (let y = 0; y < 120; y += step) {
+        for (let x = 0; x < 160; x += step) {
+          let idx = (y * 160 + x) * 4;
+          let r = px[idx] || 0, g = px[idx + 1] || 0, b = px[idx + 2] || 0;
+
+          let screenX = map(x, 0, 160, width, 0);
+          let screenY = map(y, 0, 120, 0, height);
+
+          let waveX = sin(screenY * 0.008 + time * 2) * 12 * intensity;
+          let waveY = cos(screenX * 0.008 + time * 1.5) * 10 * intensity;
+
+          let closestDist = 9999;
+          for (let ft of interactors) {
+            let dx = screenX - ft.x, dy = screenY - ft.y;
+            let d = sqrt(dx * dx + dy * dy);
+            if (d < closestDist) closestDist = d;
+            if (d < 350) {
+              let ripple = sin(d * 0.025 - time * 8) * map(d, 0, 350, 60, 0) * intensity;
+              waveX += ripple * (dx / max(d, 1));
+              waveY += ripple * (dy / max(d, 1));
+            }
+          }
+
+          let sz = map(min(closestDist, 350), 0, 350, 10 * intensity, 4);
+          let bright = (r + g + b) / 3;
+          let shift = closestDist < 350 ? map(closestDist, 0, 350, 35, 0) * intensity : 0;
+
+          noStroke();
+          fill(r + shift, g, b + shift * 0.5, map(bright, 0, 255, 100, 255));
+          ellipse(screenX + waveX, screenY + waveY, sz, sz);
+        }
+      }
+    }
+
+    // ──────────────────────────────────────
+    // Fingertip glow
+    // ──────────────────────────────────────
+    function drawFingertipGlow() {
+      for (let i = 0; i < fingertips.length; i++) {
+        let ft = fingertips[i];
+        let hue = (i * 36 + time * 80) % 360;
+        let pulse = sin(time * 6 + i * 1.2) * 4 + 10;
+        noStroke();
+        for (let r = pulse + 15; r > 0; r -= 3) {
+          fill(hue, 60, 100, map(r, 0, pulse + 15, 15, 0));
+          ellipse(ft.x, ft.y, r * 2 * intensity);
+        }
+        fill(hue, 30, 100, 70);
+        ellipse(ft.x, ft.y, 6 * intensity);
+      }
+    }
+
+    // ──────────────────────────────────────
+    // Particle with lifespan
+    // ──────────────────────────────────────
+    class Particle {
+      constructor() {
+        this.pos = createVector(random(width), random(height));
+        this.vel = p5.Vector.random2D().mult(random(0.2, 0.8));
+        this.acc = createVector(0, 0);
+        this.maxSpeed = 3;
+        this.life = random(120, 255);
+        this.decay = random(0.3, 1.2); // each particle fades at its own rate
+      }
+      applyForce(f) { this.acc.add(f); }
+      update() {
+        this.vel.add(this.acc);
+        this.vel.limit(this.maxSpeed);
+        this.pos.add(this.vel);
+        this.acc.mult(0);
+        this.vel.mult(0.98);
+      }
+      edges() {
+        if (this.pos.x > width) this.pos.x = 0;
+        if (this.pos.x < 0) this.pos.x = width;
+        if (this.pos.y > height) this.pos.y = 0;
+        if (this.pos.y < 0) this.pos.y = height;
+      }
+    }
+
+    // ──────────────────────────────────────
+    // Controls
+    // ──────────────────────────────────────
+    window.mouseWheel = function (event) {
+      intensity -= event.delta * 0.001;
+      intensity = constrain(intensity, 0.3, 3);
+      return false;
+    };
+
+    window.windowResized = function () {
+      resizeCanvas(windowWidth, windowHeight);
+      cols = floor(width / gridScale);
+      rows = floor(height / gridScale);
+    };
+  </script>
+</body>
+</html>
