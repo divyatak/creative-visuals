@@ -19,13 +19,8 @@
     #info {
       color: rgba(255,255,255,0.35); font: 15px monospace;
     }
-    #mode-label {
-      position: fixed; top: 30px; left: 50%; transform: translateX(-50%);
-      color: rgba(255,255,255,0); font: 28px monospace; font-weight: bold;
-      pointer-events: none; z-index: 10;
-      transition: color 0.4s ease;
-    }
-    #mode-label.show { color: rgba(255,255,255,0.8); }
+    #title.flash { color: rgba(255,255,255,1); transition: color 0s; }
+    #title { transition: color 0.8s ease; }
     #back {
       position: fixed; top: 20px; left: 20px;
       color: rgba(255,255,255,0.35); font: 14px monospace;
@@ -37,10 +32,9 @@
 </head>
 <body>
   <a id="back" href="../">&larr; back</a>
-  <div id="mode-label"></div>
   <div id="overlay">
-    <div id="title">WEBCAM MAGIC</div>
-    <div id="info">starting camera...</div>
+    <div id="title">loading...</div>
+    <div id="info">hold peace sign to switch</div>
   </div>
   <video id="video" playsinline></video>
 
@@ -73,7 +67,7 @@
       'Halftone Sculpt', 'ASCII Smear',
       'Mosaic Sharpen', 'Static Calm'
     ];
-    let intensity = 1.2, time = 0, modeShowTimer = 0;
+    let intensity = 1.2, time = 0;
 
     // ── Transition ──
     // Phases: glitch (0-40%) → pixel sort (40-65%) → unsort into new mode (65-100%)
@@ -112,8 +106,8 @@
           runningMode: "VIDEO", numHands: 2,
           minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
         });
-        document.getElementById('info').textContent =
-          `${MODE_NAMES[mode]} · hold peace sign to switch`;
+        document.getElementById('title').textContent = MODE_NAMES[mode];
+        document.getElementById('info').textContent = 'hold peace sign to switch';
       } catch (e) {
         document.getElementById('info').textContent = 'hand model failed — mouse fallback';
       }
@@ -228,12 +222,11 @@
 
     function doActualModeSwap() {
       mode = nextMode;
-      modeShowTimer = 90;
-      let el = document.getElementById('mode-label');
-      el.textContent = MODE_NAMES[mode];
-      el.classList.add('show');
-      document.getElementById('info').textContent =
-        `${MODE_NAMES[mode]} · hold peace sign to switch`;
+      let titleEl = document.getElementById('title');
+      titleEl.textContent = MODE_NAMES[mode];
+      // brief flash bright then settle
+      titleEl.classList.add('flash');
+      setTimeout(() => titleEl.classList.remove('flash'), 50);
       for (let g of grid) {
         g.erased = 0; g.painted = 0; g.paintedHD = 0;
         g.dotScale = 0; g.charDrag = 0; g.charDx = 0; g.charDy = 0;
@@ -368,7 +361,6 @@
       detectHands();
       grabPixels();
 
-      if (modeShowTimer > 0) { modeShowTimer--; if (modeShowTimer === 0) document.getElementById('mode-label').classList.remove('show'); }
 
       background(0);
       if (!camPx) return;
