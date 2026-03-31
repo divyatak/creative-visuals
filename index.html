@@ -2,618 +2,90 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Interactive Visuals — Hand Tracking</title>
+  <title>Creative Visuals</title>
   <style>
-    * { margin: 0; padding: 0; }
-    body { background: #000; overflow: hidden; cursor: none; }
-    canvas { display: block; }
-    video { display: none; }
-    #info {
-      position: fixed; bottom: 20px; left: 20px;
-      color: rgba(255,255,255,0.4); font: 12px monospace;
-      pointer-events: none; z-index: 10;
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0a;
+      color: #fff;
+      font-family: monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
     }
-    #mode-label {
-      position: fixed; top: 30px; left: 50%; transform: translateX(-50%);
-      color: rgba(255,255,255,0); font: 22px monospace; font-weight: bold;
-      pointer-events: none; z-index: 10;
-      transition: color 0.4s ease;
+    h1 {
+      font-size: 48px;
+      letter-spacing: 4px;
+      margin-bottom: 60px;
+      color: rgba(255,255,255,0.85);
     }
-    #mode-label.show { color: rgba(255,255,255,0.8); }
+    .sections {
+      display: flex;
+      gap: 40px;
+      flex-wrap: wrap;
+      justify-content: center;
+      max-width: 900px;
+    }
+    a.card {
+      display: block;
+      width: 380px;
+      padding: 40px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      text-decoration: none;
+      color: #fff;
+      transition: all 0.3s ease;
+      cursor: pointer;
+    }
+    a.card:hover {
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.25);
+      transform: translateY(-4px);
+    }
+    .card h2 {
+      font-size: 24px;
+      letter-spacing: 2px;
+      margin-bottom: 12px;
+    }
+    .card p {
+      font-size: 14px;
+      color: rgba(255,255,255,0.45);
+      line-height: 1.6;
+    }
+    .card .tag {
+      display: inline-block;
+      margin-top: 16px;
+      padding: 4px 10px;
+      font-size: 11px;
+      letter-spacing: 1px;
+      border-radius: 4px;
+    }
+    .tag.live {
+      background: rgba(255,255,255,0.1);
+      color: rgba(255,255,255,0.6);
+    }
+    .tag.wip {
+      background: rgba(255,200,50,0.15);
+      color: rgba(255,200,50,0.7);
+    }
   </style>
 </head>
 <body>
-  <div id="mode-label"></div>
-  <div id="info">starting camera...</div>
-  <video id="video" playsinline></video>
-
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
-  <script type="module">
-    import { HandLandmarker, FilesetResolver } from
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
-
-    // ── Hand state ──
-    let handLandmarker = null;
-    let indexFingers = [];
-    let prevFingers = [];
-    let fingerSpeed = 0; // pixels per frame
-    let videoReady = false, videoEl, lastDetect = 0, lastGrab = 0;
-
-    // victory/peace sign detection
-    let victoryDetected = false, wasVictory = false, victoryCooldown = 0;
-
-    // ── Grid ──
-    let grid = [];
-    const COLS = 100, ROWS = 75;
-    let camPx = null, hiResPx = null;
-    let cellSize, gridOffsetX, gridOffsetY;
-
-    let mode = 0;
-    const MODES = 8;
-    const MODE_NAMES = [
-      'Duotone Ripple', 'Shifted Erase', 'Thermal Paint',
-      'Halftone Sculpt', 'ASCII Smear', 'Wireframe Color',
-      'Mosaic Sharpen', 'Static Calm'
-    ];
-    let intensity = 1.2, time = 0, modeShowTimer = 0;
-
-    // ── Transition ──
-    let transitioning = false, transitionFrame = 0;
-    const TRANSITION_DURATION = 40;
-    let transitionOrigin = { x: 0, y: 0 };
-    let nextMode = 0, modeSwappedThisTransition = false;
-
-    // ── ASCII chars by density ──
-    const ASCII_CHARS = ' .:-=+*#%@';
-
-    // ── Startup ──
-    async function startApp() {
-      videoEl = document.getElementById('video');
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 640, height: 480, facingMode: 'user' }
-        });
-        videoEl.srcObject = stream;
-        await videoEl.play();
-        videoReady = true;
-        document.getElementById('info').textContent = 'camera ready · loading hand model...';
-      } catch (e) {
-        document.getElementById('info').textContent = 'camera denied — mouse fallback';
-      }
-      try {
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
-        );
-        handLandmarker = await HandLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-            delegate: "GPU"
-          },
-          runningMode: "VIDEO", numHands: 2,
-          minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
-        });
-        document.getElementById('info').textContent =
-          `${MODE_NAMES[mode]} · peace sign to switch`;
-      } catch (e) {
-        document.getElementById('info').textContent = 'hand model failed — mouse fallback';
-      }
-    }
-    startApp();
-
-    // ── Hand detection ──
-    function detectHands() {
-      if (!handLandmarker || !videoReady) return;
-      let now = performance.now();
-      if (now - lastDetect < 80) return;
-      lastDetect = now;
-
-      let results;
-      try { results = handLandmarker.detectForVideo(videoEl, now); } catch (e) { return; }
-
-      prevFingers = indexFingers.slice();
-      indexFingers = [];
-      victoryDetected = false;
-
-      if (results.landmarks && results.landmarks.length > 0) {
-        let totalW = cellSize * COLS, totalH = cellSize * ROWS;
-        results.landmarks.forEach((lms) => {
-          indexFingers.push({
-            x: gridOffsetX + (1 - lms[8].x) * totalW,
-            y: gridOffsetY + lms[8].y * totalH
-          });
-
-          // victory/peace sign: index (8) + middle (12) extended, others curled
-          let indexUp = lms[8].y < lms[6].y;   // tip above PIP
-          let middleUp = lms[12].y < lms[10].y;
-          let ringDown = lms[16].y > lms[14].y;
-          let pinkyDown = lms[20].y > lms[18].y;
-          let thumbDown = lms[4].y > lms[3].y;  // thumb not extended up
-
-          if (indexUp && middleUp && ringDown && pinkyDown && thumbDown) {
-            victoryDetected = true;
-          }
-        });
-
-        if (victoryCooldown > 0) victoryCooldown--;
-        if (victoryDetected && !wasVictory && victoryCooldown === 0) {
-          onModeSwitch();
-          victoryCooldown = 25;
-        }
-        wasVictory = victoryDetected;
-      }
-
-      // calculate finger speed
-      if (indexFingers.length > 0 && prevFingers.length > 0) {
-        let dx = indexFingers[0].x - prevFingers[0].x;
-        let dy = indexFingers[0].y - prevFingers[0].y;
-        let spd = Math.sqrt(dx * dx + dy * dy);
-        fingerSpeed = lerp(fingerSpeed, spd, 0.3); // smooth it
-      } else {
-        fingerSpeed *= 0.9;
-      }
-    }
-
-    // ── Speed-based radius: slow = big, fast = small ──
-    function getRadius() {
-      // fast = big dramatic radius, slow = small precise
-      let base = map(constrain(fingerSpeed, 0, 30), 0, 30, 40, 200) * intensity;
-      return base;
-    }
-
-    function onModeSwitch() {
-      if (transitioning) return;
-      if (indexFingers.length > 0) transitionOrigin = { ...indexFingers[0] };
-      else transitionOrigin = { x: width / 2, y: height / 2 };
-      nextMode = (mode + 1) % MODES;
-      transitioning = true;
-      transitionFrame = 0;
-      modeSwappedThisTransition = false;
-    }
-
-    function doActualModeSwap() {
-      mode = nextMode;
-      modeShowTimer = 90;
-      let el = document.getElementById('mode-label');
-      el.textContent = MODE_NAMES[mode];
-      el.classList.add('show');
-      document.getElementById('info').textContent =
-        `${MODE_NAMES[mode]} · peace sign to switch`;
-      for (let g of grid) {
-        g.erased = 0; g.painted = 0; g.paintedHD = 0;
-        g.dotScale = 0; g.charDrag = 0; g.charDx = 0; g.charDy = 0;
-        g.filled = 0; g.sharpened = 0; g.calmed = 0;
-        g.vx = 0; g.vy = 0; g.x = g.hx; g.y = g.hy;
-      }
-    }
-
-    // ── Pixels ──
-    let offCvs, offCtx, hiCvs, hiCtx;
-    function grabPixels() {
-      if (!videoReady) return;
-      let now = performance.now();
-      if (camPx && now - lastGrab < 60) return;
-      lastGrab = now;
-      if (!offCvs) {
-        offCvs = document.createElement('canvas');
-        offCvs.width = COLS; offCvs.height = ROWS;
-        offCtx = offCvs.getContext('2d', { willReadFrequently: true });
-      }
-      offCtx.drawImage(videoEl, 0, 0, COLS, ROWS);
-      camPx = offCtx.getImageData(0, 0, COLS, ROWS).data;
-      if (!hiCvs) {
-        hiCvs = document.createElement('canvas');
-        hiCvs.width = 640; hiCvs.height = 480;
-        hiCtx = hiCvs.getContext('2d', { willReadFrequently: true });
-      }
-      hiCtx.drawImage(videoEl, 0, 0, 640, 480);
-      hiResPx = hiCtx.getImageData(0, 0, 640, 480).data;
-    }
-
-    function getInteractors() {
-      return indexFingers.length > 0 ? indexFingers : [{ x: mouseX, y: mouseY }];
-    }
-
-    function getRawColor(row, col) {
-      let i = (row * COLS + col) * 4;
-      return [camPx[i] || 0, camPx[i + 1] || 0, camPx[i + 2] || 0];
-    }
-
-    function getBright(r, g, b) { return r * 0.299 + g * 0.587 + b * 0.114; }
-
-    // ── Color treatments ──
-    function treatColor(r, g, b, m) {
-      if (m === 0) { // duotone
-        let t = getBright(r, g, b) / 255;
-        return [lerp(26, 255, t), lerp(83, 107, t), lerp(92, 53, t)];
-      }
-      if (m === 1) { // hue shift
-        let rv = r / 255, gv = g / 255, bv = b / 255;
-        let mx = Math.max(rv, gv, bv), mn = Math.min(rv, gv, bv);
-        let h = 0, s = 0, l = (mx + mn) / 2;
-        if (mx !== mn) {
-          let d = mx - mn;
-          s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
-          if (mx === rv) h = ((gv - bv) / d + (gv < bv ? 6 : 0)) / 6;
-          else if (mx === gv) h = ((bv - rv) / d + 2) / 6;
-          else h = ((rv - gv) / d + 4) / 6;
-        }
-        h = (h + 0.42) % 1;
-        if (s === 0) return [l * 255, l * 255, l * 255];
-        let hue2rgb = (p, q, t) => {
-          if (t < 0) t++; if (t > 1) t--;
-          if (t < 1 / 6) return p + (q - p) * 6 * t;
-          if (t < 1 / 2) return q;
-          if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-          return p;
-        };
-        let q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
-        return [hue2rgb(p, q, h + 1 / 3) * 255, hue2rgb(p, q, h) * 255, hue2rgb(p, q, h - 1 / 3) * 255];
-      }
-      if (m === 2) { // thermal
-        let t = getBright(r, g, b) / 255;
-        if (t < 0.25) { let s = t / 0.25; return [lerp(10, 30, s), lerp(0, 20, s), lerp(40, 120, s)]; }
-        if (t < 0.5) { let s = (t - 0.25) / 0.25; return [lerp(30, 180, s), lerp(20, 30, s), lerp(120, 80, s)]; }
-        if (t < 0.75) { let s = (t - 0.5) / 0.25; return [lerp(180, 240, s), lerp(30, 120, s), lerp(80, 20, s)]; }
-        let s = (t - 0.75) / 0.25; return [lerp(240, 255, s), lerp(120, 250, s), lerp(20, 180, s)];
-      }
-      if (m === 3) { // halftone — just use brightness for dot size, pass color as green-tinted
-        let t = getBright(r, g, b) / 255;
-        return [lerp(20, 200, t), lerp(40, 220, t), lerp(30, 180, t)];
-      }
-      if (m === 4) { // ASCII — green terminal
-        let t = getBright(r, g, b) / 255;
-        return [0, lerp(30, 255, t), lerp(0, 40, t)];
-      }
-      if (m === 5) { // edge/wireframe — white edges on black
-        return [r, g, b]; // edge detection done in draw
-      }
-      if (m === 6) { // mosaic — chunky blurred
-        return [r, g, b]; // handled in draw
-      }
-      if (m === 7) { // chromatic noise
-        let nr = constrain(r + (Math.random() - 0.5) * 160, 0, 255);
-        let ng = constrain(g + (Math.random() - 0.5) * 160, 0, 255);
-        let nb = constrain(b + (Math.random() - 0.5) * 160, 0, 255);
-        return [nr, ng, nb];
-      }
-      return [r, g, b];
-    }
-
-    // ── Edge detection helper ──
-    function getEdge(row, col) {
-      if (row <= 0 || row >= ROWS - 1 || col <= 0 || col >= COLS - 1) return 0;
-      let idx = (r, c) => { let i = (r * COLS + c) * 4; return getBright(camPx[i], camPx[i + 1], camPx[i + 2]); };
-      let gx = -idx(row - 1, col - 1) - 2 * idx(row, col - 1) - idx(row + 1, col - 1)
-        + idx(row - 1, col + 1) + 2 * idx(row, col + 1) + idx(row + 1, col + 1);
-      let gy = -idx(row - 1, col - 1) - 2 * idx(row - 1, col) - idx(row - 1, col + 1)
-        + idx(row + 1, col - 1) + 2 * idx(row + 1, col) + idx(row + 1, col + 1);
-      return Math.min(Math.sqrt(gx * gx + gy * gy) / 255, 1);
-    }
-
-    // ── p5 setup ──
-    window.setup = function () {
-      createCanvas(windowWidth, windowHeight);
-      pixelDensity(1);
-      textFont('monospace');
-      initGrid();
-    };
-
-    function initGrid() {
-      let fitW = width / COLS, fitH = height / ROWS;
-      cellSize = Math.min(fitW, fitH);
-      gridOffsetX = (width - cellSize * COLS) / 2;
-      gridOffsetY = (height - cellSize * ROWS) / 2;
-      grid = [];
-      for (let row = 0; row < ROWS; row++) {
-        for (let col = 0; col < COLS; col++) {
-          grid.push({
-            hx: gridOffsetX + (COLS - 1 - col) * cellSize + cellSize / 2,
-            hy: gridOffsetY + row * cellSize + cellSize / 2,
-            x: 0, y: 0, vx: 0, vy: 0, col, row,
-            erased: 0, painted: 0, paintedHD: 0,
-            dotScale: 0, charDrag: 0, charDx: 0, charDy: 0,
-            filled: 0, sharpened: 0, calmed: 0
-          });
-          let g = grid[grid.length - 1];
-          g.x = g.hx; g.y = g.hy;
-        }
-      }
-    }
-
-    // ── Main draw ──
-    window.draw = function () {
-      time += 0.01;
-      detectHands();
-      grabPixels();
-
-      if (modeShowTimer > 0) { modeShowTimer--; if (modeShowTimer === 0) document.getElementById('mode-label').classList.remove('show'); }
-
-      background(0);
-      if (!camPx) return;
-
-      // transition — swap at 80% so glitch covers the change
-      if (transitioning) {
-        transitionFrame++;
-        let swapPoint = floor(TRANSITION_DURATION * 0.8);
-        if (transitionFrame >= swapPoint && !modeSwappedThisTransition) { doActualModeSwap(); modeSwappedThisTransition = true; }
-        if (transitionFrame >= TRANSITION_DURATION) transitioning = false;
-        drawGlitchTransition();
-        drawFingerGlow();
-        return;
-      }
-
-      let interactors = getInteractors();
-      let radius = getRadius();
-
-      for (let i = 0; i < grid.length; i++) {
-        let g = grid[i];
-        let [rawR, rawG, rawB] = getRawColor(g.row, g.col);
-        let bright = getBright(rawR, rawG, rawB);
-
-        let closestD = 9999, closestFt = null;
-        for (let ft of interactors) {
-          let d = dist(g.hx, g.hy, ft.x, ft.y);
-          if (d < closestD) { closestD = d; closestFt = ft; }
-        }
-
-        noStroke();
-
-        // ════════════════════════════════
-        if (mode === 0) {
-          // DUOTONE RIPPLE
-          let [cr, cg, cb] = treatColor(rawR, rawG, rawB, 0);
-          let totalFx = 0, totalFy = 0;
-          for (let ft of interactors) {
-            let dx = g.hx - ft.x, dy = g.hy - ft.y;
-            let d = Math.sqrt(dx * dx + dy * dy);
-            if (d < radius && d > 1) {
-              let s = map(d, 0, radius, 1, 0);
-              let wave = Math.sin(d * 0.04 - time * 8) * s * 18 * intensity;
-              totalFx += (dx / d) * wave; totalFy += (dy / d) * wave;
-            }
-          }
-          g.vx += (g.hx + totalFx - g.x) * 0.15; g.vy += (g.hy + totalFy - g.y) * 0.15;
-          g.vx *= 0.7; g.vy *= 0.7; g.x += g.vx; g.y += g.vy;
-          let disp = dist(g.x, g.y, g.hx, g.hy);
-          if (disp > 1.5) {
-            let gl = constrain(map(disp, 1.5, 40, 0, 1), 0, 1);
-            fill(min(cr + gl * 60, 255), min(cg + gl * 60, 255), min(cb + gl * 80, 255));
-            ellipse(g.x, g.y, cellSize * (1 + gl * intensity));
-          } else {
-            fill(cr, cg, cb); rect(g.hx - cellSize / 2, g.hy - cellSize / 2, cellSize, cellSize);
-          }
-        }
-
-        // ════════════════════════════════
-        else if (mode === 1) {
-          // SHIFTED ERASE
-          let [cr, cg, cb] = treatColor(rawR, rawG, rawB, 1);
-          if (closestD < radius * 0.6) g.erased = min(g.erased + 0.15, 1);
-          else g.erased = max(g.erased - 0.008, 0);
-          if (g.erased < 0.95) {
-            let a = map(g.erased, 0, 0.95, 255, 0);
-            let sz = cellSize * map(g.erased, 0, 1, 1, 0.2);
-            fill(cr, cg, cb, a); rect(g.hx - sz / 2, g.hy - sz / 2, sz, sz);
-          }
-        }
-
-        // ════════════════════════════════
-        else if (mode === 2) {
-          // THERMAL PAINT — base thermal, finger reveals real
-          let [cr, cg, cb] = treatColor(rawR, rawG, rawB, 2);
-          if (closestD < radius * 0.8) g.painted = min(g.painted + 0.08, 1);
-          else g.painted = max(g.painted - 0.003, 0);
-          fill(lerp(cr, rawR, g.painted), lerp(cg, rawG, g.painted), lerp(cb, rawB, g.painted));
-          let sz = cellSize; if (g.painted > 0.5) sz *= 1 + (g.painted - 0.5) * 0.3 * intensity;
-          rect(g.hx - sz / 2, g.hy - sz / 2, sz, sz);
-        }
-
-        // ════════════════════════════════
-        else if (mode === 3) {
-          // HALFTONE SCULPT — dots sized by brightness, finger explodes/scatters them
-          let [cr, cg, cb] = treatColor(rawR, rawG, rawB, 3);
-          let baseDotSize = map(bright, 0, 255, cellSize * 0.2, cellSize * 1.1);
-
-          if (closestD < radius && closestFt) {
-            let inf = map(closestD, 0, radius, 1, 0); inf *= inf;
-            g.dotScale = lerp(g.dotScale, inf, 0.2);
-            // push dots outward from finger
-            let dx = g.hx - closestFt.x, dy = g.hy - closestFt.y;
-            let d = Math.sqrt(dx * dx + dy * dy);
-            if (d > 1) {
-              g.vx += (dx / d) * inf * 6 * intensity;
-              g.vy += (dy / d) * inf * 6 * intensity;
-            }
-          } else {
-            g.dotScale *= 0.92;
-          }
-          // spring back to home
-          g.vx += (g.hx - g.x) * 0.08;
-          g.vy += (g.hy - g.y) * 0.08;
-          g.vx *= 0.8; g.vy *= 0.8;
-          g.x += g.vx; g.y += g.vy;
-
-          // near finger: dots shrink to nothing + scatter. far: normal halftone
-          let finalDot = baseDotSize * (1 - g.dotScale * 0.9);
-          finalDot = max(finalDot, 0.5);
-
-          // color brightens when disturbed
-          let gl = g.dotScale;
-          fill(min(cr + gl * 100, 255), min(cg + gl * 100, 255), min(cb + gl * 120, 255));
-          ellipse(g.x, g.y, finalDot);
-        }
-
-        // ════════════════════════════════
-        else if (mode === 4) {
-          // ASCII SMEAR — characters get dragged by finger
-          // uses native canvas for performance
-          let [cr, cg, cb] = treatColor(rawR, rawG, rawB, 4);
-          let charIdx = floor(map(bright, 0, 255, 0, ASCII_CHARS.length - 0.01));
-          let ch = ASCII_CHARS[charIdx];
-
-          if (closestD < radius && closestFt) {
-            let inf = map(closestD, 0, radius, 1, 0); inf *= inf;
-            let dx = g.hx - closestFt.x, dy = g.hy - closestFt.y;
-            let d = Math.sqrt(dx * dx + dy * dy);
-            if (d > 1) {
-              g.charDx += (dx / d) * inf * 8 * intensity;
-              g.charDy += (dy / d) * inf * 8 * intensity;
-            }
-            g.charDrag = max(g.charDrag, inf);
-          }
-          g.charDx *= 0.92; g.charDy *= 0.92;
-          g.charDrag *= 0.97;
-
-          // store for batch draw after loop
-          g._asciiChar = ch;
-          g._asciiR = cr; g._asciiG = cg; g._asciiB = cb;
-          g._asciiAlpha = map(g.charDrag, 0, 1, 0.78, 1);
-          g._asciiSize = cellSize * (1 + g.charDrag * 0.5);
-          g._asciiX = g.hx + g.charDx;
-          g._asciiY = g.hy + g.charDy;
-        }
-
-        // ════════════════════════════════
-        else if (mode === 5) {
-          // WIREFRAME COLOR — edges only, finger fills color like coloring book
-          let edge = getEdge(g.row, g.col);
-          if (closestD < radius * 0.8) g.filled = min(g.filled + 0.06, 1);
-          else g.filled = max(g.filled - 0.004, 0);
-
-          if (g.filled > 0.05) {
-            // colored fill
-            fill(rawR, rawG, rawB, g.filled * 220);
-            rect(g.hx - cellSize / 2, g.hy - cellSize / 2, cellSize, cellSize);
-          }
-          if (edge > 0.15) {
-            // white edge line on top
-            let edgeAlpha = map(edge, 0.15, 0.8, 60, 255);
-            fill(255, 255, 255, edgeAlpha);
-            rect(g.hx - cellSize / 2, g.hy - cellSize / 2, cellSize, cellSize);
-          }
-        }
-
-        // ════════════════════════════════
-        else if (mode === 6) {
-          // MOSAIC SHARPEN — extra chunky base, finger reveals HD
-          // chunky: use color from nearest 3x3 block center
-          let blockRow = floor(g.row / 3) * 3 + 1;
-          let blockCol = floor(g.col / 3) * 3 + 1;
-          blockRow = constrain(blockRow, 0, ROWS - 1);
-          blockCol = constrain(blockCol, 0, COLS - 1);
-          let [br, bg, bb] = getRawColor(blockRow, blockCol);
-
-          if (closestD < radius * 0.8) g.sharpened = min(g.sharpened + 0.1, 1);
-          else g.sharpened = max(g.sharpened - 0.004, 0);
-
-          if (g.sharpened > 0.1 && hiResPx) {
-            let subSteps = 4, subSize = cellSize / subSteps;
-            let totalW = cellSize * COLS, totalH = cellSize * ROWS;
-            for (let sy = 0; sy < subSteps; sy++) {
-              for (let sx = 0; sx < subSteps; sx++) {
-                let screenX = g.hx - cellSize / 2 + sx * subSize + subSize / 2;
-                let screenY = g.hy - cellSize / 2 + sy * subSize + subSize / 2;
-                let hdX = constrain(floor(map(screenX, gridOffsetX, gridOffsetX + totalW, 639, 0)), 0, 639);
-                let hdY = constrain(floor(map(screenY, gridOffsetY, gridOffsetY + totalH, 0, 479)), 0, 479);
-                let hdIdx = (hdY * 640 + hdX) * 4;
-                let hr = hiResPx[hdIdx] || 0, hg = hiResPx[hdIdx + 1] || 0, hb = hiResPx[hdIdx + 2] || 0;
-                fill(lerp(br, hr, g.sharpened), lerp(bg, hg, g.sharpened), lerp(bb, hb, g.sharpened));
-                rect(g.hx - cellSize / 2 + sx * subSize, g.hy - cellSize / 2 + sy * subSize, subSize + 0.5, subSize + 0.5);
-              }
-            }
-          } else {
-            fill(br, bg, bb);
-            rect(g.hx - cellSize / 2, g.hy - cellSize / 2, cellSize, cellSize);
-          }
-        }
-
-        // ════════════════════════════════
-        else if (mode === 7) {
-          // STATIC CALM — noisy base, finger calms the static
-          if (closestD < radius * 0.7) g.calmed = min(g.calmed + 0.12, 1);
-          else g.calmed = max(g.calmed - 0.01, 0);
-
-          let noiseAmt = (1 - g.calmed);
-          let nr = constrain(rawR + (Math.random() - 0.5) * 180 * noiseAmt, 0, 255);
-          let ng = constrain(rawG + (Math.random() - 0.5) * 180 * noiseAmt, 0, 255);
-          let nb = constrain(rawB + (Math.random() - 0.5) * 180 * noiseAmt, 0, 255);
-
-          fill(nr, ng, nb);
-          let jitterX = (Math.random() - 0.5) * 4 * noiseAmt * intensity;
-          let jitterY = (Math.random() - 0.5) * 4 * noiseAmt * intensity;
-          rect(g.hx - cellSize / 2 + jitterX, g.hy - cellSize / 2 + jitterY, cellSize, cellSize);
-        }
-      }
-
-      // batch draw ASCII using native canvas (much faster than p5 text())
-      if (mode === 4) {
-        let ctx = drawingContext; // native canvas 2D context
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        for (let g of grid) {
-          if (!g._asciiChar) continue;
-          ctx.font = `${g._asciiSize}px monospace`;
-          ctx.fillStyle = `rgba(${g._asciiR|0},${g._asciiG|0},${g._asciiB|0},${g._asciiAlpha})`;
-          ctx.fillText(g._asciiChar, g._asciiX, g._asciiY);
-        }
-      }
-
-      drawFingerGlow();
-    };
-
-    // ── Glitch transition ──
-    function drawGlitchTransition() {
-      let t = transitionFrame / TRANSITION_DURATION;
-      let ox = transitionOrigin.x, oy = transitionOrigin.y;
-      let gi;
-      if (t < 0.3) gi = map(t, 0, 0.3, 0, 1);       // ramp up fast
-      else if (t < 0.75) gi = 1;                       // hold at full
-      else gi = map(t, 0.75, 1, 1, 0);                 // quick fade at end
-      gi *= gi;
-
-      for (let i = 0; i < grid.length; i++) {
-        let g = grid[i];
-        let [rawR, rawG, rawB] = getRawColor(g.row, g.col);
-        let useMode = modeSwappedThisTransition ? nextMode : mode;
-        let [cr, cg, cb] = treatColor(rawR, rawG, rawB, useMode);
-        let dx = g.hx - ox, dy = g.hy - oy;
-        let d = Math.sqrt(dx * dx + dy * dy);
-        let proxFactor = d < 400 ? map(d, 0, 400, 1.5, 0.5) : 0.5;
-        let gf = gi * proxFactor * intensity;
-
-        let offX = g.hx + (Math.random() - 0.5) * 30 * gf;
-        let offY = g.hy + (Math.random() - 0.5) * 30 * gf;
-        let splitAmt = floor(3 * gf);
-        let rIdx = (g.row * COLS + constrain(g.col + splitAmt, 0, COLS - 1)) * 4;
-        let bIdx = (g.row * COLS + constrain(g.col - splitAmt, 0, COLS - 1)) * 4;
-        let sr = camPx[rIdx] || cr, sb = camPx[bIdx + 2] || cb;
-        let flicker = Math.random() < 0.1 * gf ? 0 : 1;
-
-        noStroke();
-        fill(sr * flicker, cg * flicker, sb * flicker);
-        let sz = cellSize * (1 + Math.random() * 0.5 * gf);
-        rect(offX - sz / 2, offY - sz / 2, sz, sz);
-      }
-    }
-
-    // ── Finger glow ──
-    function drawFingerGlow() {
-      for (let ft of indexFingers) {
-        noStroke();
-        let r = getRadius() * 0.15;
-        for (let i = r; i > 0; i -= 4) {
-          fill(255, 255, 255, map(i, 0, r, 15, 0));
-          ellipse(ft.x, ft.y, i * 2);
-        }
-        fill(255, 255, 255, 60);
-        ellipse(ft.x, ft.y, 5 * intensity);
-      }
-    }
-
-    // ── Controls ──
-    window.mouseWheel = function (e) { intensity -= e.delta * 0.001; intensity = constrain(intensity, 0.3, 3); return false; };
-    window.mousePressed = function () { if (indexFingers.length === 0) onModeSwitch(); };
-    window.windowResized = function () { resizeCanvas(windowWidth, windowHeight); initGrid(); };
-  </script>
+  <h1>CREATIVE VISUALS</h1>
+  <div class="sections">
+    <a class="card" href="webcam/">
+      <h2>WEBCAM MAGIC</h2>
+      <p>Interactive webcam effects controlled by hand tracking. Your index finger transforms a pixelated mirror — ripple, erase, paint, and more. 7 modes, peace sign to switch.</p>
+      <span class="tag live">LIVE</span>
+    </a>
+    <a class="card" href="particles/" onclick="event.preventDefault();" style="cursor: default; opacity: 0.5;">
+      <h2>PARTICLE GARDEN</h2>
+      <p>Hand-drawn flowers and leaves as interactive particles. Petals fall, leaves swirl, blooms follow your hands. Bring your own artwork to life.</p>
+      <span class="tag wip">COMING SOON</span>
+    </a>
+  </div>
 </body>
 </html>
