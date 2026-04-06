@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>(un)seen — Lenticular Gallery</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0a;
+      color: #fff;
+      font-family: monospace;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    #back {
+      position: fixed; top: 20px; left: 20px;
+      color: rgba(255,255,255,0.35); font: 14px monospace;
+      text-decoration: none; z-index: 20; cursor: pointer;
+      transition: color 0.2s;
+    }
+    #back:hover { color: rgba(255,255,255,0.8); }
+
+    /* ── Card ── */
+    .stage {
+      perspective: 1000px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      position: relative;
+      transform-style: preserve-3d;
+      will-change: transform;
+      border-radius: 6px;
+      cursor: default;
+    }
+    .card canvas {
+      display: block;
+      border-radius: 6px;
+    }
+
+    /* ── Label (outside image, right edge) ── */
+    #label {
+      position: fixed;
+      z-index: 10;
+      text-align: left;
+      pointer-events: none;
+      transition: opacity 0.3s;
+    }
+    #label-location {
+      font: 13px monospace;
+      color: rgba(255,255,255,0.45);
+      letter-spacing: 0.5px;
+      margin-bottom: 3px;
+    }
+    #label-year {
+      font: 12px monospace;
+      color: rgba(255,255,255,0.25);
+      letter-spacing: 0.5px;
+    }
+
+    /* ── Nav ── */
+    .nav-btn {
+      position: fixed;
+      top: 0; bottom: 0;
+      width: 80px;
+      background: none;
+      border: none;
+      color: rgba(255,255,255,0.12);
+      font: 48px monospace;
+      cursor: pointer;
+      z-index: 20;
+      transition: color 0.2s, background 0.2s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .nav-btn:hover {
+      color: rgba(255,255,255,0.6);
+      background: linear-gradient(to right, rgba(255,255,255,0.03), transparent);
+    }
+    #prev { left: 0; }
+    #next { right: 0; }
+    #next:hover {
+      background: linear-gradient(to left, rgba(255,255,255,0.03), transparent);
+    }
+    #nav-hint {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      font: 11px monospace;
+      color: rgba(255,255,255,0.15);
+      letter-spacing: 1px;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    /* ── Counter ── */
+    #counter {
+      position: fixed;
+      top: 20px; right: 20px;
+      font: 13px monospace;
+      color: rgba(255,255,255,0.2);
+      letter-spacing: 1px;
+      z-index: 20;
+    }
+
+    /* ── Hint ── */
+    #hint {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      font: 11px monospace;
+      color: rgba(255,255,255,0.15);
+      letter-spacing: 0.5px;
+      z-index: 20;
+      transition: opacity 2s;
+    }
+  </style>
+</head>
+<body>
+  <a id="back" href="../">&larr; back</a>
+  <div id="hint">tilt your cursor across the image</div>
+  <div id="counter"></div>
+
+  <div class="stage">
+    <div class="card" id="card">
+      <canvas id="c"></canvas>
+    </div>
+  </div>
+
+  <button class="nav-btn" id="prev">&lsaquo;</button>
+  <button class="nav-btn" id="next">&rsaquo;</button>
+  <div id="nav-hint">&larr; &rarr; to browse</div>
+
+  <div id="label">
+    <div id="label-location"></div>
+    <div id="label-year"></div>
+  </div>
+
+  <script>
+    // ══════════════════════════════════════════════
+    // DATA — swap in real photo/comic pairs here
+    // ══════════════════════════════════════════════
+    const PIECES = [
+      // ── Showcase ──
+      { location: 'Seoul', year: 2019, images: ['images/IMG_9916_photo.jpg', 'images/IMG_9916_comic.jpg'] },
+      { location: 'Over the Mediterranean', year: 2024, images: ['images/IMG20241020141309_photo.jpg', 'images/IMG20241020141309_comic.jpg'] },
+      { location: 'Istanbul', year: 2024, images: ['images/IMG20241020195245_photo.jpg', 'images/IMG20241020195245_comic.jpg'] },
+      { location: 'Basilica Cisterns, Istanbul', year: 2024, images: ['images/IMG20241021114419_photo.jpg', 'images/IMG20241021114419_comic.jpg'] },
+      { location: 'Blue Mosque, Istanbul', year: 2024, images: ['images/IMG20241021175851_photo.jpg', 'images/IMG20241021175851_comic.jpg'] },
+      { location: 'Istanbul', year: 2024, images: ['images/IMG20241022130054_photo.jpg', 'images/IMG20241022130054_comic.jpg'] },
+      { location: 'Istanbul', year: 2024, images: ['images/IMG20241022153324_photo.jpg', 'images/IMG20241022153324_comic.jpg'] },
+      { location: 'Ho Chi Minh', year: 2024, images: ['images/Untitled_Artwork_photo.jpg', 'images/Untitled_Artwork_comic.jpg'] },
+      { location: 'Jodhpur', year: 2024, images: ['images/IMG_4232_photo.jpg', 'images/IMG_4232_comic.jpg'] },
+      { location: 'Udaipur', year: 2025, images: ['images/20250208_102640_photo.jpg', 'images/20250208_102640_comic.jpg'] },
+      { location: 'Dubai', year: 2025, images: ['images/IMG20251013115727_photo.jpg', 'images/IMG20251013115727_comic.jpg'] },
+      { location: 'Abu Dhabi', year: 2025, images: ['images/IMG20251014164216_photo.jpg', 'images/IMG20251014164216_comic.jpg'] },
+      { location: 'Kochi', year: 2026, images: ['images/IMG20260110132154_photo.jpg', 'images/IMG20260110132154_comic.jpg'] },
+      // ── Solid ──
+      { location: 'India', year: 2024, images: ['images/IMG20240608213013_heic_photo.jpg', 'images/IMG20240608213013_heic_comic.jpg'] },
+      { location: 'Bosphorus Shore, Istanbul', year: 2024, images: ['images/IMG20241022103617_photo.jpg', 'images/IMG20241022103617_comic.jpg'] },
+      { location: 'Istanbul', year: 2024, images: ['images/IMG20241023094339_photo.jpg', 'images/IMG20241023094339_comic.jpg'] },
+      { location: 'Ho Chi Minh', year: 2024, images: ['images/Untitled_Artwork 1_photo.jpg', 'images/Untitled_Artwork 1_comic.jpg'] },
+      { location: 'Ho Chi Minh', year: 2024, images: ['images/Untitled_Artwork 2_photo.jpg', 'images/Untitled_Artwork 2_comic.jpg'] },
+      { location: 'Ho Chi Minh', year: 2024, images: ['images/Untitled_Artwork 3_photo.jpg', 'images/Untitled_Artwork 3_comic.jpg'] },
+      { location: 'Bangalore', year: 2024, images: ['images/Untitled_Artwork 7_photo.jpg', 'images/Untitled_Artwork 7_comic.jpg'] },
+      { location: 'Bangalore', year: 2024, images: ['images/Untitled_Artwork 8_photo.jpg', 'images/Untitled_Artwork 8_comic.jpg'] },
+      { location: 'Louvre Abu Dhabi', year: 2025, images: ['images/IMG20251005173922_photo.jpg', 'images/IMG20251005173922_comic.jpg'] },
+      { location: 'Dubai', year: 2025, images: ['images/IMG20251011161202_photo.jpg', 'images/IMG20251011161202_comic.jpg'] },
+      { location: 'Dubai', year: 2025, images: ['images/IMG20251011161612_photo.jpg', 'images/IMG20251011161612_comic.jpg'] },
+      { location: 'Dubai', year: 2025, images: ['images/IMG20251013154334_photo.jpg', 'images/IMG20251013154334_comic.jpg'] },
+      { location: 'Yayoi Kusama Museum, Tokyo', year: 2025, images: ['images/IMG_6632_photo.jpg', 'images/IMG_6632_comic.jpg'] },
+      // ── Simpler ──
+      { location: 'Gyeongju, South Korea', year: 2019, images: ['images/IMG_0106_photo.jpg', 'images/IMG_0106_comic.jpg'] },
+      { location: 'Bangalore', year: 2024, images: ['images/IMG20240327225919_photo.jpg', 'images/IMG20240327225919_comic.jpg'] },
+      { location: 'Bangalore, Indiranagar', year: 2024, images: ['images/IMG20240407150353_photo.jpg', 'images/IMG20240407150353_comic.jpg'] },
+      { location: 'Bangalore', year: 2024, images: ['images/IMG20240721135407_photo.jpg', 'images/IMG20240721135407_comic.jpg'] },
+      { location: 'Bangalore', year: 2024, images: ['images/IMG20240728144933_photo.jpg', 'images/IMG20240728144933_comic.jpg'] },
+      { location: 'Ho Chi Minh', year: 2024, images: ['images/Untitled_Artwork 4_photo.jpg', 'images/Untitled_Artwork 4_comic.jpg'] },
+      { location: 'Ho Chi Minh', year: 2024, images: ['images/Untitled_Artwork 5_photo.jpg', 'images/Untitled_Artwork 5_comic.jpg'] },
+      { location: 'Ho Chi Minh', year: 2024, images: ['images/Untitled_Artwork 6_photo.jpg', 'images/Untitled_Artwork 6_comic.jpg'] },
+      { location: 'Colombo', year: 2025, images: ['images/IMG-20250309-WA0083_photo.jpg', 'images/IMG-20250309-WA0083_comic.jpg'] },
+      { location: 'Dubai', year: 2025, images: ['images/IMG20251011155850_photo.jpg', 'images/IMG20251011155850_comic.jpg'] },
+    ];
+
+    // ══════════════════════════════════════════════
+    // STATE
+    // ══════════════════════════════════════════════
+    let current = 0;
+    let loadedImages = []; // array of arrays
+    let angle = 0.5, targetAngle = 0.5;
+    let rotY = 0, targetRotY = 0;
+    let rotX = 0, targetRotX = 0;
+    let hovered = false;
+    let time = 0;
+    let transitioning = false;
+    let transAlpha = 1; // 1 = fully visible, fades to 0 then back
+
+    const LENTICULE_DENSITY = 7;
+    const RIDGE_DARKEN = 0.1;
+
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const cardEl = document.getElementById('card');
+    let displayW = 0, displayH = 0;
+
+    // ══════════════════════════════════════════════
+    // LOAD IMAGES
+    // ══════════════════════════════════════════════
+    async function loadAll() {
+      for (const piece of PIECES) {
+        const imgs = [];
+        for (const src of piece.images) {
+          const img = new Image();
+          img.src = src;
+          await new Promise(r => { img.onload = r; img.onerror = r; });
+          if (img.naturalWidth > 0) imgs.push(img);
+        }
+        loadedImages.push(imgs);
+      }
+      sizeCanvas();
+      updateInfo();
+    }
+
+    function sizeCanvas() {
+      const imgs = loadedImages[current];
+      if (!imgs || imgs.length === 0) return;
+      const img = imgs[0];
+      const aspect = img.naturalWidth / img.naturalHeight;
+
+      // fit within viewport with padding
+      const maxW = window.innerWidth * 0.65;
+      const maxH = window.innerHeight * 0.78;
+
+      if (maxW / maxH > aspect) {
+        displayH = maxH;
+        displayW = displayH * aspect;
+      } else {
+        displayW = maxW;
+        displayH = displayW / aspect;
+      }
+
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = displayW * dpr;
+      canvas.height = displayH * dpr;
+      canvas.style.width = displayW + 'px';
+      canvas.style.height = displayH + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    // ══════════════════════════════════════════════
+    // NAVIGATION
+    // ══════════════════════════════════════════════
+    function goTo(idx) {
+      if (transitioning) return;
+      const next = ((idx % PIECES.length) + PIECES.length) % PIECES.length;
+      if (next === current) return;
+      transitioning = true;
+      transAlpha = 1;
+      // fade out, swap, fade in
+      const fadeOut = () => {
+        transAlpha -= 0.06;
+        if (transAlpha <= 0) {
+          transAlpha = 0;
+          current = next;
+          sizeCanvas();
+          updateInfo();
+          fadeIn();
+          return;
+        }
+        requestAnimationFrame(fadeOut);
+      };
+      const fadeIn = () => {
+        transAlpha += 0.06;
+        if (transAlpha >= 1) {
+          transAlpha = 1;
+          transitioning = false;
+          return;
+        }
+        requestAnimationFrame(fadeIn);
+      };
+      fadeOut();
+    }
+
+    function updateInfo() {
+      const p = PIECES[current];
+      document.getElementById('counter').textContent = `${current + 1} / ${PIECES.length}`;
+      document.getElementById('label-location').textContent = p.location;
+      document.getElementById('label-year').textContent = p.year;
+      positionLabel();
+    }
+
+    function positionLabel() {
+      const rect = canvas.getBoundingClientRect();
+      const label = document.getElementById('label');
+      // right edge of image, vertically near the bottom
+      label.style.left = (rect.right + 16) + 'px';
+      label.style.top = (rect.bottom - 40) + 'px';
+    }
+
+    // ══════════════════════════════════════════════
+    // RENDER
+    // ══════════════════════════════════════════════
+    function frame() {
+      time += 0.016;
+
+      if (hovered) {
+        angle += (targetAngle - angle) * 0.18;
+        rotY += (targetRotY - rotY) * 0.12;
+        rotX += (targetRotX - rotX) * 0.12;
+      } else {
+        const auto = 0.5 + 0.22 * Math.sin(time * 0.45);
+        angle += (auto - angle) * 0.035;
+        const autoRY = 7 * Math.sin(time * 0.45);
+        rotY += (autoRY - rotY) * 0.035;
+        rotX += (0 - rotX) * 0.05;
+      }
+
+      cardEl.style.transform = `rotateY(${rotY}deg) rotateX(${rotX}deg)`;
+
+      drawLenticular();
+      positionLabel();
+      requestAnimationFrame(frame);
+    }
+
+    function drawLenticular() {
+      const images = loadedImages[current];
+      if (!images || images.length === 0) return;
+
+      const W = displayW;
+      const H = displayH;
+      const N = images.length;
+
+      ctx.clearRect(0, 0, W, H);
+      ctx.globalAlpha = transAlpha;
+
+      const lenticuleCount = Math.round(W / 100 * LENTICULE_DENSITY);
+      const lenticuleW = W / lenticuleCount;
+
+      // image selection
+      const globalPhase = angle * (N - 1);
+      const clamped = Math.max(0, Math.min(N - 1.001, globalPhase));
+      const imgIdx = Math.floor(clamped);
+      const rawBlend = clamped - imgIdx;
+      const blend = Math.max(0, Math.min(1, (rawBlend - 0.5) * 10 + 0.5));
+
+      for (let i = 0; i < lenticuleCount; i++) {
+        const stripX = i * lenticuleW;
+        const srcFrac = i / lenticuleCount;
+
+        const srcImg = images[imgIdx];
+        const srcX = srcFrac * srcImg.naturalWidth;
+        const srcW = srcImg.naturalWidth / lenticuleCount;
+
+        ctx.globalAlpha = transAlpha;
+        ctx.drawImage(srcImg, srcX, 0, srcW, srcImg.naturalHeight, stripX, 0, lenticuleW + 0.5, H);
+
+        if (blend > 0.005 && imgIdx + 1 < N) {
+          const next = images[imgIdx + 1];
+          ctx.globalAlpha = transAlpha * blend;
+          ctx.drawImage(next, srcFrac * next.naturalWidth, 0, next.naturalWidth / lenticuleCount, next.naturalHeight, stripX, 0, lenticuleW + 0.5, H);
+        }
+
+        // lens curvature shading
+        ctx.globalAlpha = transAlpha;
+        const g = ctx.createLinearGradient(stripX, 0, stripX + lenticuleW, 0);
+        g.addColorStop(0, `rgba(0,0,0,${RIDGE_DARKEN})`);
+        g.addColorStop(0.18, `rgba(0,0,0,${RIDGE_DARKEN * 0.25})`);
+        g.addColorStop(0.5, 'rgba(0,0,0,0)');
+        g.addColorStop(0.82, `rgba(0,0,0,${RIDGE_DARKEN * 0.25})`);
+        g.addColorStop(1, `rgba(0,0,0,${RIDGE_DARKEN})`);
+        ctx.fillStyle = g;
+        ctx.fillRect(stripX, 0, lenticuleW, H);
+      }
+
+      // ridge lines
+      ctx.globalAlpha = transAlpha;
+      ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+      ctx.lineWidth = 0.5;
+      for (let i = 1; i < lenticuleCount; i++) {
+        const x = i * lenticuleW;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+      }
+
+      // specular sweep
+      const specX = angle * W;
+      const specW = W * 0.18;
+      const sg = ctx.createLinearGradient(specX - specW, 0, specX + specW, 0);
+      sg.addColorStop(0, 'rgba(255,255,255,0)');
+      sg.addColorStop(0.4, 'rgba(255,255,255,0.025)');
+      sg.addColorStop(0.5, 'rgba(255,255,255,0.05)');
+      sg.addColorStop(0.6, 'rgba(255,255,255,0.025)');
+      sg.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = sg;
+      ctx.fillRect(0, 0, W, H);
+
+      // label positioning is handled in updateLabel()
+
+      ctx.globalAlpha = 1;
+    }
+
+    // ══════════════════════════════════════════════
+    // EVENTS
+    // ══════════════════════════════════════════════
+    cardEl.addEventListener('mouseenter', () => { hovered = true; });
+    cardEl.addEventListener('mouseleave', () => {
+      hovered = false;
+      targetRotY = 0;
+      targetRotX = 0;
+    });
+    cardEl.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const nx = (e.clientX - rect.left) / rect.width;
+      const ny = (e.clientY - rect.top) / rect.height;
+      targetAngle = Math.max(0, Math.min(1, nx));
+      targetRotY = (nx - 0.5) * 24;
+      targetRotX = -(ny - 0.5) * 10;
+    });
+
+    // touch
+    cardEl.addEventListener('touchmove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const nx = (e.touches[0].clientX - rect.left) / rect.width;
+      const ny = (e.touches[0].clientY - rect.top) / rect.height;
+      targetAngle = Math.max(0, Math.min(1, nx));
+      targetRotY = (nx - 0.5) * 24;
+      targetRotX = -(ny - 0.5) * 10;
+      hovered = true;
+    }, { passive: true });
+    cardEl.addEventListener('touchend', () => {
+      hovered = false;
+      targetRotY = 0;
+      targetRotX = 0;
+    });
+
+    // nav
+    document.getElementById('prev').addEventListener('click', () => goTo(current - 1));
+    document.getElementById('next').addEventListener('click', () => goTo(current + 1));
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') goTo(current - 1);
+      if (e.key === 'ArrowRight') goTo(current + 1);
+    });
+
+    window.addEventListener('resize', () => { sizeCanvas(); positionLabel(); });
+
+    // fade out hint after a few seconds
+    setTimeout(() => { document.getElementById('hint').style.opacity = '0'; }, 4000);
+
+    // ══════════════════════════════════════════════
+    // INIT
+    // ══════════════════════════════════════════════
+    loadAll().then(() => frame());
+  </script>
+</body>
+</html>
