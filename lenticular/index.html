@@ -19,7 +19,7 @@
     #back {
       position: fixed; top: 20px; left: 20px;
       color: rgba(255,255,255,0.35); font: 14px monospace;
-      text-decoration: none; z-index: 20; cursor: pointer;
+      text-decoration: none; z-index: 30; cursor: pointer;
       transition: color 0.2s;
     }
     #back:hover { color: rgba(255,255,255,0.8); }
@@ -63,41 +63,93 @@
       letter-spacing: 0.5px;
     }
 
-    /* ── Nav ── */
+    /* ── Nav arrows ── */
     .nav-btn {
       position: fixed;
-      top: 0; bottom: 0;
-      width: 80px;
-      background: none;
-      border: none;
-      color: rgba(255,255,255,0.12);
-      font: 48px monospace;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.35);
+      width: 44px; height: 44px;
+      border-radius: 50%;
+      font-size: 20px;
       cursor: pointer;
       z-index: 20;
-      transition: color 0.2s, background 0.2s;
+      transition: all 0.2s;
       display: flex;
       align-items: center;
       justify-content: center;
+      line-height: 1;
     }
     .nav-btn:hover {
-      color: rgba(255,255,255,0.6);
-      background: linear-gradient(to right, rgba(255,255,255,0.03), transparent);
+      color: rgba(255,255,255,0.8);
+      background: rgba(255,255,255,0.1);
+      border-color: rgba(255,255,255,0.2);
     }
-    #prev { left: 0; }
-    #next { right: 0; }
-    #next:hover {
-      background: linear-gradient(to left, rgba(255,255,255,0.03), transparent);
-    }
-    #nav-hint {
+    #prev { left: 20px; }
+    #next { right: 20px; }
+
+    /* ── Thumbnail strip ── */
+    #strip {
       position: fixed;
-      bottom: 20px;
+      bottom: 16px;
       left: 50%;
       transform: translateX(-50%);
-      font: 11px monospace;
-      color: rgba(255,255,255,0.15);
-      letter-spacing: 1px;
-      z-index: 10;
-      pointer-events: none;
+      display: flex;
+      gap: 4px;
+      z-index: 20;
+      max-width: 80vw;
+      overflow-x: auto;
+      padding: 4px;
+      scrollbar-width: none;
+    }
+    #strip::-webkit-scrollbar { display: none; }
+    .thumb {
+      width: 28px; height: 38px;
+      border-radius: 3px;
+      border: 1px solid rgba(255,255,255,0.08);
+      opacity: 0.3;
+      cursor: pointer;
+      transition: opacity 0.2s, border-color 0.2s;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+    .thumb:hover { opacity: 0.7; }
+    .thumb.active {
+      opacity: 1;
+      border-color: rgba(255,255,255,0.5);
+    }
+    .thumb.previewing {
+      opacity: 0.8;
+      border-color: rgba(255,255,255,0.3);
+    }
+
+    /* ── Loading ── */
+    #loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0a0a0a;
+      z-index: 50;
+      transition: opacity 0.5s;
+    }
+    #loading.done { opacity: 0; pointer-events: none; }
+    .spinner {
+      width: 24px; height: 24px;
+      border: 2px solid rgba(255,255,255,0.1);
+      border-top-color: rgba(255,255,255,0.4);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #load-text {
+      margin-left: 14px;
+      font: 13px monospace;
+      color: rgba(255,255,255,0.3);
+      letter-spacing: 0.5px;
     }
 
     /* ── Counter ── */
@@ -129,15 +181,21 @@
   <div id="hint">tilt your cursor across the image</div>
   <div id="counter"></div>
 
+  <div id="loading">
+    <div class="spinner"></div>
+    <div id="load-text">loading...</div>
+  </div>
+
   <div class="stage">
     <div class="card" id="card">
       <canvas id="c"></canvas>
     </div>
   </div>
 
-  <button class="nav-btn" id="prev">&lsaquo;</button>
-  <button class="nav-btn" id="next">&rsaquo;</button>
-  <div id="nav-hint">&larr; &rarr; to browse</div>
+  <button class="nav-btn" id="prev">&#8249;</button>
+  <button class="nav-btn" id="next">&#8250;</button>
+
+  <div id="strip"></div>
 
   <div id="label">
     <div id="label-location"></div>
@@ -215,6 +273,10 @@
     // LOAD IMAGES
     // ══════════════════════════════════════════════
     async function loadAll() {
+      const loadingEl = document.getElementById('loading');
+      const loadText = document.getElementById('load-text');
+      let loaded = 0;
+
       for (const piece of PIECES) {
         const imgs = [];
         for (const src of piece.images) {
@@ -224,13 +286,45 @@
           if (img.naturalWidth > 0) imgs.push(img);
         }
         loadedImages.push(imgs);
+        loaded++;
+        loadText.textContent = `loading ${loaded} / ${PIECES.length}`;
       }
+
+      loadingEl.classList.add('done');
+      buildStrip();
       sizeCanvas();
       updateInfo();
     }
 
-    function sizeCanvas() {
-      const imgs = loadedImages[current];
+    let previewing = -1; // index being hovered, -1 = none
+
+    function buildStrip() {
+      const strip = document.getElementById('strip');
+      for (let i = 0; i < PIECES.length; i++) {
+        const thumb = document.createElement('img');
+        thumb.className = 'thumb' + (i === 0 ? ' active' : '');
+        thumb.src = PIECES[i].images[PIECES[i].images.length - 1];
+        thumb.addEventListener('mouseenter', () => {
+          previewing = i;
+          sizeCanvas(i);
+          updateInfo(i);
+        });
+        thumb.addEventListener('click', () => {
+          goTo(i);
+          previewing = -1;
+        });
+        strip.appendChild(thumb);
+      }
+      strip.addEventListener('mouseleave', () => {
+        previewing = -1;
+        sizeCanvas();
+        updateInfo();
+      });
+    }
+
+    function sizeCanvas(idx) {
+      const which = idx !== undefined ? idx : current;
+      const imgs = loadedImages[which];
       if (!imgs || imgs.length === 0) return;
       const img = imgs[0];
       const aspect = img.naturalWidth / img.naturalHeight;
@@ -262,6 +356,16 @@
       if (transitioning) return;
       const next = ((idx % PIECES.length) + PIECES.length) % PIECES.length;
       if (next === current) return;
+
+      // if already previewing this image, just commit instantly
+      if (previewing === next) {
+        current = next;
+        previewing = -1;
+        sizeCanvas();
+        updateInfo();
+        return;
+      }
+
       transitioning = true;
       transAlpha = 1;
       // fade out, swap, fade in
@@ -289,12 +393,23 @@
       fadeOut();
     }
 
-    function updateInfo() {
-      const p = PIECES[current];
-      document.getElementById('counter').textContent = `${current + 1} / ${PIECES.length}`;
+    function updateInfo(idx) {
+      const which = idx !== undefined ? idx : current;
+      const p = PIECES[which];
+      document.getElementById('counter').textContent = `${which + 1} / ${PIECES.length}`;
       document.getElementById('label-location').textContent = p.location;
       document.getElementById('label-year').textContent = p.year;
       positionLabel();
+
+      // update thumbnail strip
+      const thumbs = document.querySelectorAll('.thumb');
+      thumbs.forEach((t, i) => {
+        t.classList.toggle('active', i === current);
+        t.classList.toggle('previewing', i === which && which !== current);
+      });
+      if (thumbs[which]) {
+        thumbs[which].scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+      }
     }
 
     function positionLabel() {
@@ -316,10 +431,10 @@
         rotY += (targetRotY - rotY) * 0.12;
         rotX += (targetRotX - rotX) * 0.12;
       } else {
-        const auto = 0.5 + 0.22 * Math.sin(time * 0.45);
-        angle += (auto - angle) * 0.035;
-        const autoRY = 7 * Math.sin(time * 0.45);
-        rotY += (autoRY - rotY) * 0.035;
+        const auto = 0.5 + 0.25 * Math.sin(time * 0.35);
+        angle += (auto - angle) * 0.03;
+        const autoRY = 8 * Math.sin(time * 0.35);
+        rotY += (autoRY - rotY) * 0.03;
         rotX += (0 - rotX) * 0.05;
       }
 
@@ -331,7 +446,8 @@
     }
 
     function drawLenticular() {
-      const images = loadedImages[current];
+      const which = previewing >= 0 ? previewing : current;
+      const images = loadedImages[which];
       if (!images || images.length === 0) return;
 
       const W = displayW;
@@ -349,7 +465,7 @@
       const clamped = Math.max(0, Math.min(N - 1.001, globalPhase));
       const imgIdx = Math.floor(clamped);
       const rawBlend = clamped - imgIdx;
-      const blend = Math.max(0, Math.min(1, (rawBlend - 0.5) * 10 + 0.5));
+      const blend = Math.max(0, Math.min(1, (rawBlend - 0.5) * 2 + 0.5));
 
       for (let i = 0; i < lenticuleCount; i++) {
         const stripX = i * lenticuleW;
