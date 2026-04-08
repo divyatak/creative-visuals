@@ -25,7 +25,7 @@
 <body>
   <a id="back" href="../">&larr; back</a>
   <div id="phase-label"></div>
-  <div id="hint" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font:15px monospace;color:rgba(255,255,255,0.2);letter-spacing:2px;pointer-events:none;z-index:10;transition:opacity 1.5s;">move your hand to see magic</div>
+  <div id="hint" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font:20px monospace;color:rgba(255,255,255,0.35);letter-spacing:3px;pointer-events:none;z-index:10;transition:opacity 1.5s;">allow camera to see magic</div>
   <video id="video" playsinline style="display:none;"></video>
 
   <script type="importmap">
@@ -118,7 +118,13 @@
       seeds[i] = Math.random() * 1000;
       ages[i] = 0;
       maxAges[i] = 6 + Math.random() * 14; // longer lives — algae persist
-      hueOffsets[i] = (Math.random() - 0.5) * 0.12; // tighter cyan-blue range
+      // weighted color pick: 25% teal, 45% cyan, 10% blue, 10% purple, 10% green
+      const roll = Math.random();
+      if (roll < 0.25) hueOffsets[i] = 0.47 + Math.random() * 0.03;       // teal
+      else if (roll < 0.70) hueOffsets[i] = 0.50 + Math.random() * 0.03;  // cyan
+      else if (roll < 0.80) hueOffsets[i] = 0.58 + Math.random() * 0.04;  // blue
+      else if (roll < 0.90) hueOffsets[i] = 0.72 + Math.random() * 0.06;  // purple
+      else hueOffsets[i] = 0.38 + Math.random() * 0.04;                   // green
       excitation[i] = 0;
     }
 
@@ -145,9 +151,9 @@
         varying float vAlpha;
         varying float vHue;
         void main() {
-          vAlpha = aLife;
+          vAlpha = aLife * 1.3;
           vHue = aHueOff;
-          float sz = 2.5 + aLife * 2.0; // brighter = slightly bigger
+          float sz = 3.0 + aLife * 2.5; // brighter = bigger glow
           gl_PointSize = sz;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
         }
@@ -166,8 +172,8 @@
           float d = length(gl_PointCoord - .5) * 2.;
           if (d > 1.) discard;
           float a = (1.-d*d) * vAlpha;
-          // bioluminescent blue-cyan
-          float h = .54 + vHue;
+          // hue set directly per particle (teal/cyan/blue/purple/green)
+          float h = vHue;
           vec3 c = hue2rgb(h);
           // when excited, push toward bright white-cyan
           c = mix(c, vec3(.6, .95, .9), vAlpha * 0.4);
@@ -325,7 +331,11 @@
         videoEl.srcObject = stream;
         await videoEl.play();
         videoReady = true;
-      } catch (e) { return; }
+        document.getElementById('hint').textContent = 'move your hand to see magic';
+      } catch (e) {
+        document.getElementById('hint').textContent = 'move your mouse to see magic';
+        return;
+      }
 
       try {
         const vision = await FilesetResolver.forVisionTasks(
