@@ -25,6 +25,7 @@
 <body>
   <a id="back" href="../">&larr; back</a>
   <div id="phase-label"></div>
+  <div id="hint" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font:15px monospace;color:rgba(255,255,255,0.2);letter-spacing:2px;pointer-events:none;z-index:10;transition:opacity 1.5s;">move your hand to see magic</div>
   <video id="video" playsinline style="display:none;"></video>
 
   <script type="importmap">
@@ -42,7 +43,7 @@
     // ══════════════════════════════════════════════
     // CONFIG
     // ══════════════════════════════════════════════
-    const PARTICLE_COUNT = 40000;
+    const PARTICLE_COUNT = 25000;
     const PHASE_DURATION = 20;
     const W = window.innerWidth, H = window.innerHeight;
 
@@ -84,12 +85,12 @@
     trailCam.position.z = 10;
     trailScene.add(fadeQuad);
 
-    // composite trail to screen at full brightness (feedback fade handles decay)
+    // composite trail to screen with global breathing glow
     const compMat = new THREE.ShaderMaterial({
-      uniforms: { tTrail: { value: null } },
+      uniforms: { tTrail: { value: null }, uBreath: { value: 1.0 } },
       vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
-      fragmentShader: `uniform sampler2D tTrail; varying vec2 vUv;
-        void main(){ gl_FragColor=texture2D(tTrail,vUv); }`,
+      fragmentShader: `uniform sampler2D tTrail; uniform float uBreath; varying vec2 vUv;
+        void main(){ gl_FragColor=texture2D(tTrail,vUv) * uBreath; }`,
       transparent: true, depthWrite: false
     });
     const compQuad = new THREE.Mesh(fullGeo.clone(), compMat);
@@ -364,12 +365,10 @@
           for (let j = 0; j < 21; j++) {
             interactors.push(lm2scene(hand[j]));
           }
-
           // ── Interpolated palm fill points ──
           for (let a = 0; a < PALM_VERTS.length; a++) {
             for (let b = a + 1; b < PALM_VERTS.length; b++) {
               const la = hand[PALM_VERTS[a]], lb = hand[PALM_VERTS[b]];
-              // midpoint between each pair of palm landmarks
               interactors.push(lm2scene({ x: (la.x+lb.x)/2, y: (la.y+lb.y)/2 }));
             }
           }
@@ -395,6 +394,9 @@
     const phaseEl = document.getElementById('phase-label');
     const NAMES = ['reveal', 'disturb', 'draw'];
     let smoothMouseActive = 0;
+    let hintVisible = true;
+    let idleTime = 0;
+    const hintEl = document.getElementById('hint');
 
     function animate() {
       requestAnimationFrame(animate);
@@ -413,7 +415,8 @@
       const mouseRadBase = 60 + disturb * 40;
       const flowStr    = 0.35; // gentle ocean drift
       const flowScale  = 0.0015;
-      fadeMat.uniforms.fade.value = 0.955; // long trails for glow persistence
+      // breathing: trail persistence oscillates → whole field gently pulses
+      fadeMat.uniforms.fade.value = 0.91 + 0.015 * Math.sin(time * 0.3);
 
       const posArr = geo.attributes.position.array;
       const lifeArr = geo.attributes.aLife.array;
@@ -435,9 +438,9 @@
         const fadeIn = Math.min(1, ageNorm / 0.1);
         const fadeOut = Math.min(1, (1 - ageNorm) / 0.2);
         const ageFade = fadeIn * fadeOut;
-        // ambient: barely visible. excitation: bright glow
-        const ambient = 0.04;
-        lifeArr[i] = ageFade * (ambient + excitation[i] * 0.8);
+        // breathing ambient: each particle gently pulses at its own rate
+        const breath = 0.08 + 0.03 * Math.sin(time * (0.3 + seeds[i] * 0.0004) + seeds[i]);
+        lifeArr[i] = ageFade * (breath + excitation[i] * 0.8);
 
         let px = posArr[ix], py = posArr[iy];
 
@@ -457,16 +460,16 @@
           if (dist < rad && dist > 0.1) {
             const inf = 1 - dist/rad;
             const infSq = inf * inf;
-            mouseActiveSum += infSq;
-            mx += dx/dist * infSq * 1.5;
-            my += dy/dist * infSq * 1.5;
+            mouseActiveSum += inf;
+            mx += dx/dist * inf * 0.25;
+            my += dy/dist * inf * 0.25;
             // excite this particle — it was disturbed
-            excitation[i] = Math.min(1, excitation[i] + infSq * 0.3);
+            excitation[i] = Math.min(1, excitation[i] + inf * 0.06);
             disturbed = true;
           }
         }
         // excitation decays slowly
-        if (!disturbed) excitation[i] *= 0.985;
+        if (!disturbed) excitation[i] *= 0.95; // fast glow decay
 
         const jx = (Math.random() - 0.5) * 0.15;
         const jy = (Math.random() - 0.5) * 0.15;
@@ -495,6 +498,15 @@
 
       pMat.uniforms.uPhase.value = phase;
       pMat.uniforms.uMouseActive.value = smoothMouseActive;
+
+      // hint text: hide on activity, show after idle
+      if (hasHands || mouseIn) {
+        idleTime = 0;
+        if (hintVisible) { hintEl.style.opacity = '0'; hintVisible = false; }
+      } else {
+        idleTime += dt;
+        if (idleTime > 8 && !hintVisible) { hintEl.style.opacity = '1'; hintVisible = true; }
+      }
 
       // ── Render with trails ──
       // 1. trail buffer: fade previous frame, draw fresh particles on top
