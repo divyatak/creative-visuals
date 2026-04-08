@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Audio Reactive</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #050508; overflow: hidden; }
+    canvas { display: block; }
+    #ui { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    #ui.hidden { opacity: 0; pointer-events: none; transition: opacity 1s; }
+    #drop-text { font: 22px monospace; color: rgba(255,255,255,0.3); letter-spacing: 3px; cursor: pointer; }
+    #drop-sub { margin-top: 8px; font: 12px monospace; color: rgba(255,255,255,0.15); }
+    #file-input { display: none; }
+    #back { position: fixed; top: 20px; left: 20px; color: rgba(255,255,255,0.35); font: 14px monospace; text-decoration: none; z-index: 40; }
+    #controls { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 20; opacity: 0; }
+    #controls.visible { opacity: 1; }
+    #controls button { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: rgba(255,255,255,0.4); font: 13px monospace; padding: 6px 16px; border-radius: 4px; cursor: pointer; }
+    #mode-label { position: fixed; top: 20px; right: 20px; font: 12px monospace; color: rgba(255,255,255,0.2); z-index: 20; }
+  </style>
+</head>
+<body>
+  <a id="back" href="../">&larr; back</a>
+  <div id="ui">
+    <div id="drop-text">drop an audio file or click here</div>
+    <div id="drop-sub">supports mp3, wav, ogg, flac</div>
+  </div>
+  <input type="file" id="file-input" accept="audio/*">
+  <div id="controls"><button id="pause-btn">pause</button></div>
+  <div id="mode-label">wireframe</div>
+
+  <script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+
+    /* ── renderer (identical to working test.html) ── */
+    const renderer = new THREE.WebGLRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x050508);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 60, 250);
+    camera.lookAt(0, 0, 0);
+
+    /* ── just one shape to start: wireframe icosahedron ── */
+    const geo = new THREE.IcosahedronGeometry(60, 2);
+    const basePos = Float32Array.from(geo.attributes.position.array);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x00e5ff, wireframe: true }));
+    scene.add(mesh);
+
+    /* ── audio ── */
+    let audioCtx, analyser, freqData, audioReady = false, sourceConnected = false;
+    const audioEl = new Audio();
+
+    function initAudio(file) {
+      if (!audioCtx) {
+        audioCtx = new AudioContext();
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.82;
+        freqData = new Uint8Array(analyser.frequencyBinCount);
+      }
+      audioEl.src = URL.createObjectURL(file);
+      audioEl.loop = true;
+      if (!sourceConnected) {
+        audioCtx.createMediaElementSource(audioEl).connect(analyser);
+        analyser.connect(audioCtx.destination);
+        sourceConnected = true;
+      }
+      audioEl.play();
+      audioReady = true;
+      document.getElementById('ui').className = 'hidden';
+      document.getElementById('controls').className = 'visible';
+    }
+
+    function getBass() {
+      if (!audioReady) return 0;
+      analyser.getByteFrequencyData(freqData);
+      let sum = 0;
+      for (let i = 0; i < 10; i++) sum += freqData[i];
+      return (sum / 10) / 255;
+    }
+
+    /* ── file handling ── */
+    document.getElementById('ui').addEventListener('click', () => document.getElementById('file-input').click());
+    document.getElementById('file-input').addEventListener('change', (e) => { if (e.target.files[0]) initAudio(e.target.files[0]); });
+    document.body.addEventListener('dragover', (e) => e.preventDefault());
+    document.body.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const f = e.dataTransfer.files[0];
+      if (f && f.type.startsWith('audio/')) initAudio(f);
+    });
+
+    let paused = false;
+    document.getElementById('pause-btn').addEventListener('click', () => {
+      paused = !paused;
+      if (paused) { audioEl.pause(); document.getElementById('pause-btn').textContent = 'play'; }
+      else { audioEl.play(); document.getElementById('pause-btn').textContent = 'pause'; }
+    });
+
+    /* ── animate ── */
+    let time = 0, sBass = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      time += 0.016;
+
+      const bass = getBass();
+      sBass += (bass - sBass) * 0.15;
+
+      // deform with bass
+      const pos = geo.attributes.position.array;
+      for (let i = 0; i < pos.length; i += 3) {
+        const bx = basePos[i], by = basePos[i+1], bz = basePos[i+2];
+        const d = Math.sqrt(bx*bx + by*by + bz*bz) || 1;
+        pos[i]   = bx + bx/d * sBass * 30;
+        pos[i+1] = by + by/d * sBass * 30;
+        pos[i+2] = bz + bz/d * sBass * 30;
+      }
+      geo.attributes.position.needsUpdate = true;
+
+      mesh.rotation.y = time * 0.3;
+      mesh.rotation.x = Math.sin(time * 0.15) * 0.3;
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+  </script>
+</body>
+</html>
