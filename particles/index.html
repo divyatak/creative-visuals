@@ -224,125 +224,92 @@
     let lastDetect = 0;
     const videoEl = document.getElementById('video');
 
-    // finger chains for wireframe outline
-    const FINGER_CHAINS = [
-      [0,1,2,3,4],      // thumb
-      [0,5,6,7,8],      // index
-      [5,9],             // index base → middle base
-      [9,10,11,12],      // middle
-      [9,13],            // middle base → ring base
-      [13,14,15,16],     // ring
-      [13,17],           // ring base → pinky base
-      [0,17,18,19,20],   // pinky
-    ];
-    // palm landmarks for interpolated fill
     const PALM_VERTS = [0, 1, 5, 9, 13, 17];
 
-    // ── Hand silhouette (filled shape from bone quads + palm polygon) ──
-    // Bones: each finger chain + palm cross-links
-    const BONES = [
-      // thumb
-      [0,1,18,14], [1,2,14,11], [2,3,11,8], [3,4,8,6],
-      // index
-      [0,5,18,14], [5,6,14,11], [6,7,11,8], [7,8,8,6],
-      // middle
-      [0,9,18,14], [9,10,14,11], [10,11,11,8], [11,12,8,6],
-      // ring
-      [0,13,18,14], [13,14,14,11], [14,15,11,8], [15,16,8,6],
-      // pinky
-      [0,17,18,14], [17,18,14,11], [18,19,11,8], [19,20,8,6],
-      // palm cross-links
-      [5,9,14,14], [9,13,14,14], [13,17,14,14],
-    ]; // [lmA, lmB, widthA, widthB] — width in pixels per side
+    // ── Hand wireframe (Three.js LineSegments in main scene) ──
+    // Line segments: [from, to] pairs
+    const HAND_LINES = [
+      // fingers (no 0→1 or 0→5, those go through palm)
+      [1,2],[2,3],[3,4],               // thumb
+      [5,6],[6,7],[7,8],               // index
+      [9,10],[10,11],[11,12],          // middle
+      [13,14],[14,15],[15,16],         // ring
+      [17,18],[18,19],[19,20],         // pinky
+      // palm outline
+      [0,1],                           // wrist → thumb base
+      [5,9],[9,13],[13,17],            // finger base connections
+      [0,17],                          // wrist → pinky base
+      // thumb-index bridge: interpolated curve via extra points
+      // (we'll add interpolated segments in buildHandLines)
+    ];
 
-    // palm fill triangles: fan from center to 0,1,5,9,13,17
-    const PALM_FAN = [0, 1, 5, 9, 13, 17];
-
-    // max triangles: 23 bones × 2 tris + palm fan ~5 tris + finger webs ~8 tris = ~60
-    const MAX_TRIS = 80;
-    const handSilMat = new THREE.ShaderMaterial({
-      vertexShader: `
-        void main() {
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        void main() {
-          vec3 col = vec3(0.35, 0.15, 0.55);
-          gl_FragColor = vec4(col, 0.08);
-        }
-      `,
+    const handLineMat = new THREE.ShaderMaterial({
+      vertexShader: `void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `void main() { gl_FragColor = vec4(0.4, 0.75, 0.9, 0.2); }`,
       transparent: true, depthWrite: false,
       blending: THREE.AdditiveBlending,
       side: THREE.DoubleSide
     });
 
-    const handSilGeos = [];
-    const handSilMeshes = [];
+    // each segment = 2 triangles (quad), max ~30 segments
+    const MAX_HAND_TRIS = 80;
+    const handLineGeos = [];
+    const handLineMeshes = [];
     for (let h = 0; h < 2; h++) {
       const g = new THREE.BufferGeometry();
-      const pos = new Float32Array(MAX_TRIS * 3 * 3); // 3 verts × 3 coords per tri
+      const pos = new Float32Array(MAX_HAND_TRIS * 3 * 3);
       g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       g.setDrawRange(0, 0);
-      const mesh = new THREE.Mesh(g, handSilMat);
+      const mesh = new THREE.Mesh(g, handLineMat);
       mesh.visible = false;
       mesh.frustumCulled = false;
       scene.add(mesh);
-      handSilGeos.push(g);
-      handSilMeshes.push(mesh);
+      handLineGeos.push(g);
+      handLineMeshes.push(mesh);
     }
 
-    function buildHandMesh(handIdx, landmarks) {
+    const LINE_W = 3; // line thickness in pixels
+
+    function buildHandLines(handIdx, landmarks) {
       const pts = landmarks.map(lm => lm2scene(lm));
-      const posArr = handSilGeos[handIdx].attributes.position.array;
+      const posArr = handLineGeos[handIdx].attributes.position.array;
       let vi = 0;
 
-      function addTri(ax,ay, bx,by, cx,cy) {
-        posArr[vi++]=ax; posArr[vi++]=ay; posArr[vi++]=0.5;
-        posArr[vi++]=bx; posArr[vi++]=by; posArr[vi++]=0.5;
-        posArr[vi++]=cx; posArr[vi++]=cy; posArr[vi++]=0.5;
-      }
-
-      function addBoneQuad(idxA, idxB, wA, wB) {
-        const a = pts[idxA], b = pts[idxB];
-        const dx = b.x-a.x, dy = b.y-a.y;
+      function addQuad(ax,ay, bx,by, w) {
+        const dx = bx-ax, dy = by-ay;
         const len = Math.sqrt(dx*dx+dy*dy);
         if (len < 0.1) return;
-        const nx = -dy/len, ny = dx/len; // perpendicular
-        // quad: 4 corners
-        const a0x=a.x+nx*wA, a0y=a.y+ny*wA;
-        const a1x=a.x-nx*wA, a1y=a.y-ny*wA;
-        const b0x=b.x+nx*wB, b0y=b.y+ny*wB;
-        const b1x=b.x-nx*wB, b1y=b.y-ny*wB;
-        addTri(a0x,a0y, a1x,a1y, b0x,b0y);
-        addTri(a1x,a1y, b1x,b1y, b0x,b0y);
+        const nx = -dy/len * w, ny = dx/len * w;
+        // two triangles
+        posArr[vi++]=ax+nx; posArr[vi++]=ay+ny; posArr[vi++]=1;
+        posArr[vi++]=ax-nx; posArr[vi++]=ay-ny; posArr[vi++]=1;
+        posArr[vi++]=bx+nx; posArr[vi++]=by+ny; posArr[vi++]=1;
+        posArr[vi++]=ax-nx; posArr[vi++]=ay-ny; posArr[vi++]=1;
+        posArr[vi++]=bx-nx; posArr[vi++]=by-ny; posArr[vi++]=1;
+        posArr[vi++]=bx+nx; posArr[vi++]=by+ny; posArr[vi++]=1;
       }
 
-      // draw all bone quads
-      for (const [a, b, wA, wB] of BONES) {
-        addBoneQuad(a, b, wA, wB);
+      // straight segments
+      for (const [a, b] of HAND_LINES) {
+        addQuad(pts[a].x, pts[a].y, pts[b].x, pts[b].y, LINE_W);
       }
 
-      // palm fill: triangle fan
-      let cx=0, cy=0;
-      for (const idx of PALM_FAN) { cx += pts[idx].x; cy += pts[idx].y; }
-      cx /= PALM_FAN.length; cy /= PALM_FAN.length;
-      for (let j = 0; j < PALM_FAN.length; j++) {
-        const a = pts[PALM_FAN[j]];
-        const b = pts[PALM_FAN[(j+1) % PALM_FAN.length]];
-        addTri(cx, cy, a.x, a.y, b.x, b.y);
+      // thumb-index curve
+      const cpx = (pts[1].x + pts[2].x + pts[5].x) / 3;
+      const cpy = (pts[1].y + pts[2].y + pts[5].y) / 3;
+      const STEPS = 8;
+      for (let s = 0; s < STEPS; s++) {
+        const t0 = s / STEPS, t1 = (s + 1) / STEPS;
+        const ax = (1-t0)*(1-t0)*pts[1].x + 2*(1-t0)*t0*cpx + t0*t0*pts[5].x;
+        const ay = (1-t0)*(1-t0)*pts[1].y + 2*(1-t0)*t0*cpy + t0*t0*pts[5].y;
+        const bx = (1-t1)*(1-t1)*pts[1].x + 2*(1-t1)*t1*cpx + t1*t1*pts[5].x;
+        const by = (1-t1)*(1-t1)*pts[1].y + 2*(1-t1)*t1*cpy + t1*t1*pts[5].y;
+        addQuad(ax, ay, bx, by, LINE_W);
       }
 
-      // finger web fills (between adjacent finger bases)
-      const WEBS = [[5,6,9,10], [9,10,13,14], [13,14,17,18]];
-      for (const [a,b,c,d] of WEBS) {
-        addTri(pts[a].x,pts[a].y, pts[c].x,pts[c].y, pts[b].x,pts[b].y);
-        addTri(pts[b].x,pts[b].y, pts[c].x,pts[c].y, pts[d].x,pts[d].y);
-      }
-
-      handSilGeos[handIdx].attributes.position.needsUpdate = true;
-      handSilGeos[handIdx].setDrawRange(0, vi / 3);
-      handSilMeshes[handIdx].visible = true;
+      handLineGeos[handIdx].attributes.position.needsUpdate = true;
+      handLineGeos[handIdx].setDrawRange(0, vi / 3);
+      handLineMeshes[handIdx].visible = true;
     }
 
     function lm2scene(lm) {
@@ -384,7 +351,7 @@
       let results;
       try { results = handLandmarker.detectForVideo(videoEl, now); } catch(e) { return; }
 
-      for (const m of handSilMeshes) m.visible = false;
+      for (const m of handLineMeshes) m.visible = false;
 
       if (results.landmarks && results.landmarks.length > 0) {
         hasHands = true;
@@ -412,8 +379,8 @@
           cx /= PALM_VERTS.length; cy /= PALM_VERTS.length;
           interactors.push(lm2scene({ x: cx, y: cy }));
 
-          // ── Update hand silhouette mesh ──
-          buildHandMesh(h, hand);
+          // ── Update hand wireframe ──
+          buildHandLines(h, hand);
         }
       } else {
         hasHands = false;
