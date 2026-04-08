@@ -46,11 +46,88 @@
     camera.position.set(0, 60, 250);
     camera.lookAt(0, 0, 0);
 
-    /* ── just one shape to start: wireframe icosahedron ── */
-    const geo = new THREE.IcosahedronGeometry(60, 2);
-    const basePos = Float32Array.from(geo.attributes.position.array);
-    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x00e5ff, wireframe: true }));
-    scene.add(mesh);
+    /* ── MODE 0: SHATTERING WIREFRAME ── */
+    const mode0 = new THREE.Group();
+    const faces = [];
+    const srcGeo = new THREE.IcosahedronGeometry(60, 3);
+    // convert to non-indexed so we can just read position triples as faces
+    const nonIndexed = srcGeo.toNonIndexed();
+    const srcArr = nonIndexed.attributes.position.array;
+    for (let f = 0; f < srcArr.length; f += 9) {
+      const v = srcArr.slice(f, f + 9);
+      const cx = (v[0]+v[3]+v[6])/3, cy = (v[1]+v[4]+v[7])/3, cz = (v[2]+v[5]+v[8])/3;
+      const d = Math.sqrt(cx*cx+cy*cy+cz*cz) || 1;
+      // local space verts
+      const lv = new Float32Array(9);
+      for (let j = 0; j < 9; j += 3) { lv[j]=v[j]-cx; lv[j+1]=v[j+1]-cy; lv[j+2]=v[j+2]-cz; }
+      const fg = new THREE.BufferGeometry();
+      fg.setAttribute('position', new THREE.BufferAttribute(lv, 3));
+      const mat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, wireframe: true, side: THREE.DoubleSide });
+      const fm = new THREE.Mesh(fg, mat);
+      fm.position.set(cx, cy, cz);
+      mode0.add(fm);
+      faces.push({ m: fm, mat, cx, cy, cz, d, nx: cx/d, ny: cy/d, nz: cz/d, rx: Math.random()*2-1, ry: Math.random()*2-1 });
+    }
+    scene.add(mode0);
+
+    /* ── MODE 1: RINGS ── */
+    const mode1 = new THREE.Group();
+    const rings = [];
+    for (let i = 0; i < 8; i++) {
+      const c = new THREE.Color(0xff0d64).lerp(new THREE.Color(0x00e5ff), i / 8);
+      const m = new THREE.Mesh(
+        new THREE.TorusGeometry(30 + i * 15, 0.4, 6, 80),
+        new THREE.MeshBasicMaterial({ color: c, wireframe: true })
+      );
+      m.rotation.x = Math.PI / 2 + (i - 4) * 0.15;
+      mode1.add(m);
+      rings.push(m);
+    }
+    mode1.visible = false;
+    scene.add(mode1);
+
+    /* ── MODE 2: GRID TERRAIN ── */
+    const mode2 = new THREE.Group();
+    const gridGeo = new THREE.PlaneGeometry(400, 400, 60, 60);
+    gridGeo.rotateX(-Math.PI / 2);
+    const gridBase = Float32Array.from(gridGeo.attributes.position.array);
+    mode2.add(new THREE.Mesh(gridGeo, new THREE.MeshBasicMaterial({ color: 0x1a33ff, wireframe: true })));
+    mode2.visible = false;
+    scene.add(mode2);
+
+    /* ── MODE 3: RIBBONS ── */
+    const mode3 = new THREE.Group();
+    const ribbonGeos = [];
+    for (let r = 0; r < 6; r++) {
+      const arr = new Float32Array(150 * 3);
+      // initialize with a visible line so it doesn't start degenerate
+      for (let p = 0; p < 150; p++) {
+        arr[p * 3] = (p / 150 - 0.5) * 300;
+        arr[p * 3 + 1] = Math.sin(p * 0.1 + r) * 20;
+        arr[p * 3 + 2] = Math.cos(p * 0.08 + r) * 15;
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+      const c = new THREE.Color(0x8800ff).lerp(new THREE.Color(0x00e5ff), r / 6);
+      mode3.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: c })));
+      ribbonGeos.push({ geo: g, off: r * 1.5 });
+    }
+    mode3.visible = false;
+    scene.add(mode3);
+
+    /* ── mode management ── */
+    const MODES = [mode0, mode1, mode2, mode3];
+    const NAMES = ['wireframe', 'rings', 'terrain', 'ribbons'];
+    let curMode = 0;
+    document.getElementById('mode-label').textContent = NAMES[0];
+
+    renderer.domElement.addEventListener('click', () => {
+      if (!audioReady) return;
+      MODES[curMode].visible = false;
+      curMode = (curMode + 1) % MODES.length;
+      MODES[curMode].visible = true;
+      document.getElementById('mode-label').textContent = NAMES[curMode];
+    });
 
     /* ── audio ── */
     let audioCtx, analyser, freqData, audioReady = false, sourceConnected = false;
@@ -77,12 +154,14 @@
       document.getElementById('controls').className = 'visible';
     }
 
-    function getBass() {
+    function getEnergy(low, high) {
       if (!audioReady) return 0;
       analyser.getByteFrequencyData(freqData);
-      let sum = 0;
-      for (let i = 0; i < 10; i++) sum += freqData[i];
-      return (sum / 10) / 255;
+      const bins = freqData.length, ny = audioCtx.sampleRate / 2;
+      const lo = Math.floor(low / ny * bins), hi = Math.min(Math.floor(high / ny * bins), bins - 1);
+      let sum = 0, count = 0;
+      for (let i = lo; i <= hi; i++) { sum += freqData[i]; count++; }
+      return count > 0 ? (sum / count) / 255 : 0;
     }
 
     /* ── file handling ── */
@@ -103,28 +182,96 @@
     });
 
     /* ── animate ── */
-    let time = 0, sBass = 0;
+    let time = 0, sBass = 0, sMid = 0, sHigh = 0;
+    let prevBass = 0, prevMid = 0, prevHigh = 0;
+    let bassAttack = 0, midAttack = 0, highAttack = 0; // spike detectors
+    let bassPunch = 0; // decaying punch for rhythmic hits
 
     function animate() {
       requestAnimationFrame(animate);
       time += 0.016;
 
-      const bass = getBass();
+      const bass = getEnergy(20, 150);
+      const mid = getEnergy(150, 2000);
+      const high = getEnergy(2000, 16000);
       sBass += (bass - sBass) * 0.15;
+      sMid += (mid - sMid) * 0.12;
+      sHigh += (high - sHigh) * 0.1;
 
-      // deform with bass
-      const pos = geo.attributes.position.array;
-      for (let i = 0; i < pos.length; i += 3) {
-        const bx = basePos[i], by = basePos[i+1], bz = basePos[i+2];
-        const d = Math.sqrt(bx*bx + by*by + bz*bz) || 1;
-        pos[i]   = bx + bx/d * sBass * 30;
-        pos[i+1] = by + by/d * sBass * 30;
-        pos[i+2] = bz + bz/d * sBass * 30;
+      // attack detection: how much did energy JUMP this frame?
+      bassAttack = Math.max(0, bass - prevBass);
+      midAttack = Math.max(0, mid - prevMid);
+      highAttack = Math.max(0, high - prevHigh);
+      prevBass = bass; prevMid = mid; prevHigh = high;
+
+      // bass punch: spikes on kick drums, decays fast
+      bassPunch = Math.max(bassPunch * 0.85, bassAttack * 4);
+
+      if (curMode === 0) {
+        // shatter: faces fly outward on bass punches, reassemble when quiet
+        const explode = bassPunch * 60;
+        // color shifts with mids: cyan → pink → purple
+        const hue = (sMid * 0.8 + time * 0.05) % 1;
+        const midColor = new THREE.Color().setHSL(hue * 0.3 + 0.5, 0.9, 0.5 + sBass * 0.2);
+
+        for (let i = 0; i < faces.length; i++) {
+          const f = faces[i];
+          // pure outward displacement — no rotation, no size change
+          // music breaks the sphere, silence reassembles it
+          f.m.position.set(
+            f.cx + f.nx * explode,
+            f.cy + f.ny * explode,
+            f.cz + f.nz * explode
+          );
+          f.mat.color.copy(midColor);
+        }
+
+        mode0.rotation.y = time * (0.15 + sBass * 0.2);
+        mode0.rotation.x = Math.sin(time * 0.12) * 0.2;
       }
-      geo.attributes.position.needsUpdate = true;
 
-      mesh.rotation.y = time * 0.3;
-      mesh.rotation.x = Math.sin(time * 0.15) * 0.3;
+      if (curMode === 1) {
+        for (let i = 0; i < rings.length; i++) {
+          const band = i / 8;
+          const e = band < 0.35 ? sBass : band < 0.65 ? sMid : sHigh;
+          rings[i].scale.setScalar(1 + e * 0.4);
+          rings[i].rotation.z = time * (0.2 + i*0.08) * (i%2 ? 1 : -1);
+          rings[i].rotation.x = Math.PI/2 + (i-4)*0.15 + Math.sin(time*0.5+i)*e*0.3;
+        }
+      }
+
+      if (curMode === 2) {
+        const p = gridGeo.attributes.position.array;
+        for (let i = 0; i < p.length; i += 3) {
+          const x = gridBase[i], z = gridBase[i+2];
+          p[i+1] = Math.sin(x*0.02+time*1.5)*Math.cos(z*0.02+time)*sBass*40
+                  + Math.sin(x*0.08+time*4)*Math.sin(z*0.06-time*3)*sMid*15
+                  + Math.sin(x*0.3+z*0.3+time*10)*sHigh*5;
+        }
+        gridGeo.attributes.position.needsUpdate = true;
+      }
+
+      if (curMode === 3) {
+        for (let r = 0; r < ribbonGeos.length; r++) {
+          const rb = ribbonGeos[r];
+          const pos = rb.geo.attributes.position.array;
+          for (let p = 0; p < 150; p++) {
+            const s = p / 150;
+            pos[p*3] = (s - 0.5) * 300;
+            pos[p*3+1] = Math.sin(s*4+time*2+rb.off)*(20+sBass*40) + Math.sin(s*12+time*5+rb.off*2)*sMid*15;
+            pos[p*3+2] = Math.cos(s*3+time*1.5+rb.off)*(15+sMid*20) + Math.sin(s*8+time*6)*sHigh*10;
+          }
+          rb.geo.attributes.position.needsUpdate = true;
+        }
+      }
+
+      // camera
+      const camY = curMode === 2 ? 120 : 60;
+      const camZ = curMode === 2 ? 180 : 250;
+      camera.position.x += (Math.sin(time*0.1)*30 - camera.position.x) * 0.02;
+      camera.position.y += (camY + Math.sin(time*0.07)*15 - camera.position.y) * 0.02;
+      camera.position.z += (camZ + Math.cos(time*0.08)*20 - camera.position.z) * 0.02;
+      camera.lookAt(0, 0, 0);
 
       renderer.render(scene, camera);
     }
