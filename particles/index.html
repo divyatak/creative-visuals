@@ -103,25 +103,27 @@
     const velocities = new Float32Array(PARTICLE_COUNT * 2);
     const seeds = new Float32Array(PARTICLE_COUNT);
     const lifetimes = new Float32Array(PARTICLE_COUNT);
-    const ages = new Float32Array(PARTICLE_COUNT);       // 0→1 over lifespan
-    const maxAges = new Float32Array(PARTICLE_COUNT);    // how long this particle lives
-    const hueOffsets = new Float32Array(PARTICLE_COUNT); // per-particle color
+    const ages = new Float32Array(PARTICLE_COUNT);
+    const maxAges = new Float32Array(PARTICLE_COUNT);
+    const hueOffsets = new Float32Array(PARTICLE_COUNT);
+    const excitation = new Float32Array(PARTICLE_COUNT); // 0=dark, 1=fully glowing
 
     function respawn(i) {
       positions[i*3]     = (Math.random() - 0.5) * W;
       positions[i*3 + 1] = (Math.random() - 0.5) * H;
       positions[i*3 + 2] = 0;
-      velocities[i*2]     = (Math.random() - 0.5) * 1.5;
-      velocities[i*2 + 1] = (Math.random() - 0.5) * 1.5;
+      velocities[i*2]     = (Math.random() - 0.5) * 0.3;
+      velocities[i*2 + 1] = (Math.random() - 0.5) * 0.3;
       seeds[i] = Math.random() * 1000;
       ages[i] = 0;
-      maxAges[i] = 4 + Math.random() * 10; // 4-14 seconds lifespan
-      hueOffsets[i] = (Math.random() - 0.5) * 0.22; // ±0.22 → cyan(0.36) through blue, purple, to pink(0.80)
+      maxAges[i] = 6 + Math.random() * 14; // longer lives — algae persist
+      hueOffsets[i] = (Math.random() - 0.5) * 0.12; // tighter cyan-blue range
+      excitation[i] = 0;
     }
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       respawn(i);
-      ages[i] = Math.random() * maxAges[i]; // stagger initial ages
+      ages[i] = Math.random() * maxAges[i];
     }
 
     const geo = new THREE.BufferGeometry();
@@ -137,24 +139,14 @@
       },
       vertexShader: `
         attribute float aSeed;
-        attribute float aLife;
+        attribute float aLife; // encodes: ageFade * (ambient + excitation)
         attribute float aHueOff;
-        uniform float uPhase;
-        uniform float uMouseActive;
         varying float vAlpha;
         varying float vHue;
         void main() {
-          float reveal  = max(0., 1. - uPhase);
-          float disturb = 1. - abs(uPhase - 1.);
-          float draw    = max(0., uPhase - 1.5) * 2.;
-          float baseBright = 0.3 + disturb * 0.25 + draw * 0.15;
-          float ageFade = aLife;
-          vAlpha = baseBright * (0.3 + 0.7 * ageFade);
-          vAlpha *= mix(1., 0.25, reveal * (1. - uMouseActive));
-          // per-particle hue — only the small random offset, no seed drift
+          vAlpha = aLife;
           vHue = aHueOff;
-          float sz = mix(4.0, 6.5, disturb + draw * 0.5) * (0.4 + ageFade * 0.9);
-          sz *= mix(0.7, 1., min(1., uMouseActive + (1. - reveal)));
+          float sz = 2.5 + aLife * 2.0; // brighter = slightly bigger
           gl_PointSize = sz;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
         }
@@ -173,10 +165,11 @@
           float d = length(gl_PointCoord - .5) * 2.;
           if (d > 1.) discard;
           float a = (1.-d*d) * vAlpha;
-          // cyan-blue center (~0.58): cyans at low end, purples/pinks at high
-          float h = .58 + vHue;
+          // bioluminescent blue-cyan
+          float h = .54 + vHue;
           vec3 c = hue2rgb(h);
-          c += vec3(.03,.04,.06) * (1.-d);
+          // when excited, push toward bright white-cyan
+          c = mix(c, vec3(.6, .95, .9), vAlpha * 0.4);
           gl_FragColor = vec4(c, a);
         }
       `,
@@ -230,7 +223,131 @@
     let videoReady = false;
     let lastDetect = 0;
     const videoEl = document.getElementById('video');
-    const FINGERTIPS = [4, 8, 12, 16, 20]; // thumb, index, middle, ring, pinky
+
+    // finger chains for wireframe outline
+    const FINGER_CHAINS = [
+      [0,1,2,3,4],      // thumb
+      [0,5,6,7,8],      // index
+      [5,9],             // index base → middle base
+      [9,10,11,12],      // middle
+      [9,13],            // middle base → ring base
+      [13,14,15,16],     // ring
+      [13,17],           // ring base → pinky base
+      [0,17,18,19,20],   // pinky
+    ];
+    // palm landmarks for interpolated fill
+    const PALM_VERTS = [0, 1, 5, 9, 13, 17];
+
+    // ── Hand silhouette (filled shape from bone quads + palm polygon) ──
+    // Bones: each finger chain + palm cross-links
+    const BONES = [
+      // thumb
+      [0,1,18,14], [1,2,14,11], [2,3,11,8], [3,4,8,6],
+      // index
+      [0,5,18,14], [5,6,14,11], [6,7,11,8], [7,8,8,6],
+      // middle
+      [0,9,18,14], [9,10,14,11], [10,11,11,8], [11,12,8,6],
+      // ring
+      [0,13,18,14], [13,14,14,11], [14,15,11,8], [15,16,8,6],
+      // pinky
+      [0,17,18,14], [17,18,14,11], [18,19,11,8], [19,20,8,6],
+      // palm cross-links
+      [5,9,14,14], [9,13,14,14], [13,17,14,14],
+    ]; // [lmA, lmB, widthA, widthB] — width in pixels per side
+
+    // palm fill triangles: fan from center to 0,1,5,9,13,17
+    const PALM_FAN = [0, 1, 5, 9, 13, 17];
+
+    // max triangles: 23 bones × 2 tris + palm fan ~5 tris + finger webs ~8 tris = ~60
+    const MAX_TRIS = 80;
+    const handSilMat = new THREE.ShaderMaterial({
+      vertexShader: `
+        void main() {
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        void main() {
+          vec3 col = vec3(0.35, 0.15, 0.55);
+          gl_FragColor = vec4(col, 0.08);
+        }
+      `,
+      transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide
+    });
+
+    const handSilGeos = [];
+    const handSilMeshes = [];
+    for (let h = 0; h < 2; h++) {
+      const g = new THREE.BufferGeometry();
+      const pos = new Float32Array(MAX_TRIS * 3 * 3); // 3 verts × 3 coords per tri
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setDrawRange(0, 0);
+      const mesh = new THREE.Mesh(g, handSilMat);
+      mesh.visible = false;
+      mesh.frustumCulled = false;
+      scene.add(mesh);
+      handSilGeos.push(g);
+      handSilMeshes.push(mesh);
+    }
+
+    function buildHandMesh(handIdx, landmarks) {
+      const pts = landmarks.map(lm => lm2scene(lm));
+      const posArr = handSilGeos[handIdx].attributes.position.array;
+      let vi = 0;
+
+      function addTri(ax,ay, bx,by, cx,cy) {
+        posArr[vi++]=ax; posArr[vi++]=ay; posArr[vi++]=0.5;
+        posArr[vi++]=bx; posArr[vi++]=by; posArr[vi++]=0.5;
+        posArr[vi++]=cx; posArr[vi++]=cy; posArr[vi++]=0.5;
+      }
+
+      function addBoneQuad(idxA, idxB, wA, wB) {
+        const a = pts[idxA], b = pts[idxB];
+        const dx = b.x-a.x, dy = b.y-a.y;
+        const len = Math.sqrt(dx*dx+dy*dy);
+        if (len < 0.1) return;
+        const nx = -dy/len, ny = dx/len; // perpendicular
+        // quad: 4 corners
+        const a0x=a.x+nx*wA, a0y=a.y+ny*wA;
+        const a1x=a.x-nx*wA, a1y=a.y-ny*wA;
+        const b0x=b.x+nx*wB, b0y=b.y+ny*wB;
+        const b1x=b.x-nx*wB, b1y=b.y-ny*wB;
+        addTri(a0x,a0y, a1x,a1y, b0x,b0y);
+        addTri(a1x,a1y, b1x,b1y, b0x,b0y);
+      }
+
+      // draw all bone quads
+      for (const [a, b, wA, wB] of BONES) {
+        addBoneQuad(a, b, wA, wB);
+      }
+
+      // palm fill: triangle fan
+      let cx=0, cy=0;
+      for (const idx of PALM_FAN) { cx += pts[idx].x; cy += pts[idx].y; }
+      cx /= PALM_FAN.length; cy /= PALM_FAN.length;
+      for (let j = 0; j < PALM_FAN.length; j++) {
+        const a = pts[PALM_FAN[j]];
+        const b = pts[PALM_FAN[(j+1) % PALM_FAN.length]];
+        addTri(cx, cy, a.x, a.y, b.x, b.y);
+      }
+
+      // finger web fills (between adjacent finger bases)
+      const WEBS = [[5,6,9,10], [9,10,13,14], [13,14,17,18]];
+      for (const [a,b,c,d] of WEBS) {
+        addTri(pts[a].x,pts[a].y, pts[c].x,pts[c].y, pts[b].x,pts[b].y);
+        addTri(pts[b].x,pts[b].y, pts[c].x,pts[c].y, pts[d].x,pts[d].y);
+      }
+
+      handSilGeos[handIdx].attributes.position.needsUpdate = true;
+      handSilGeos[handIdx].setDrawRange(0, vi / 3);
+      handSilMeshes[handIdx].visible = true;
+    }
+
+    function lm2scene(lm) {
+      return { x: (1 - lm.x) * W - W/2, y: -(lm.y * H - H/2) };
+    }
 
     async function startHands() {
       try {
@@ -240,7 +357,7 @@
         videoEl.srcObject = stream;
         await videoEl.play();
         videoReady = true;
-      } catch (e) { return; } // no camera — mouse only
+      } catch (e) { return; }
 
       try {
         const vision = await FilesetResolver.forVisionTasks(
@@ -261,23 +378,42 @@
     function detectHands() {
       if (!handLandmarker || !videoReady) return;
       const now = performance.now();
-      if (now - lastDetect < 80) return; // ~12fps detection
+      if (now - lastDetect < 80) return;
       lastDetect = now;
 
       let results;
       try { results = handLandmarker.detectForVideo(videoEl, now); } catch(e) { return; }
 
+      for (const m of handSilMeshes) m.visible = false;
+
       if (results.landmarks && results.landmarks.length > 0) {
         hasHands = true;
         interactors = [];
-        for (const hand of results.landmarks) {
-          for (const tip of FINGERTIPS) {
-            // landmarks are 0-1, mirrored. Map to scene coords.
-            interactors.push({
-              x: (1 - hand[tip].x) * W - W/2,  // mirror + center
-              y: -(hand[tip].y * H - H/2)       // flip y + center
-            });
+
+        for (let h = 0; h < results.landmarks.length && h < 2; h++) {
+          const hand = results.landmarks[h];
+
+          // ── All 21 landmarks as repel points ──
+          for (let j = 0; j < 21; j++) {
+            interactors.push(lm2scene(hand[j]));
           }
+
+          // ── Interpolated palm fill points ──
+          for (let a = 0; a < PALM_VERTS.length; a++) {
+            for (let b = a + 1; b < PALM_VERTS.length; b++) {
+              const la = hand[PALM_VERTS[a]], lb = hand[PALM_VERTS[b]];
+              // midpoint between each pair of palm landmarks
+              interactors.push(lm2scene({ x: (la.x+lb.x)/2, y: (la.y+lb.y)/2 }));
+            }
+          }
+          // palm center
+          let cx = 0, cy = 0;
+          for (const v of PALM_VERTS) { cx += hand[v].x; cy += hand[v].y; }
+          cx /= PALM_VERTS.length; cy /= PALM_VERTS.length;
+          interactors.push(lm2scene({ x: cx, y: cy }));
+
+          // ── Update hand silhouette mesh ──
+          buildHandMesh(h, hand);
         }
       } else {
         hasHands = false;
@@ -307,10 +443,10 @@
       const disturb = 1 - Math.abs(phase - 1);
       const draw    = Math.max(0, phase - 1.5) * 2;
 
-      const mouseRadBase = 35 + disturb * 40 + draw * 30;
-      const flowStr    = 1.2 + disturb * 1.8 + draw * 0.8;
-      const flowScale  = 0.0018 + disturb * 0.0008;
-      fadeMat.uniforms.fade.value = 0.94 + draw * 0.02 + reveal * 0.01;
+      const mouseRadBase = 60 + disturb * 40;
+      const flowStr    = 0.35; // gentle ocean drift
+      const flowScale  = 0.0015;
+      fadeMat.uniforms.fade.value = 0.955; // long trails for glow persistence
 
       const posArr = geo.attributes.position.array;
       const lifeArr = geo.attributes.aLife.array;
@@ -331,20 +467,23 @@
         // fade in first 10%, fade out last 20%
         const fadeIn = Math.min(1, ageNorm / 0.1);
         const fadeOut = Math.min(1, (1 - ageNorm) / 0.2);
-        lifeArr[i] = fadeIn * fadeOut;
+        const ageFade = fadeIn * fadeOut;
+        // ambient: barely visible. excitation: bright glow
+        const ambient = 0.04;
+        lifeArr[i] = ageFade * (ambient + excitation[i] * 0.8);
 
         let px = posArr[ix], py = posArr[iy];
 
-        // ── Flow field ──
-        const fx = curlX(px, py, time, flowScale) * flowStr;
-        const fy = curlY(px, py, time, flowScale) * flowStr;
+        // ── Gentle ocean drift ──
+        const fx = curlX(px, py, time * 0.4, flowScale) * flowStr;
+        const fy = curlY(px, py, time * 0.4, flowScale) * flowStr;
 
-        // ── Repel from all interaction points (hands or mouse) ──
+        // ── Disturbance: repel + excite ──
         let mx = 0, my = 0;
-        // build active points: hands if available, else mouse
         const points = hasHands ? interactors : (mouseIn ? [{x: mouseX, y: mouseY}] : []);
         const radNoise = 0.7 + 0.6 * (Math.sin(seeds[i] * 3.7 + time * 2) * 0.5 + 0.5);
         const rad = mouseRadBase * radNoise;
+        let disturbed = false;
         for (let p = 0; p < points.length; p++) {
           const dx = px - points[p].x, dy = py - points[p].y;
           const dist = Math.sqrt(dx*dx + dy*dy);
@@ -352,15 +491,22 @@
             const inf = 1 - dist/rad;
             const infSq = inf * inf;
             mouseActiveSum += infSq;
-            mx += dx/dist * infSq * 2.5;
-            my += dy/dist * infSq * 2.5;
+            mx += dx/dist * infSq * 1.5;
+            my += dy/dist * infSq * 1.5;
+            // excite this particle — it was disturbed
+            excitation[i] = Math.min(1, excitation[i] + infSq * 0.3);
+            disturbed = true;
           }
         }
+        // excitation decays slowly
+        if (!disturbed) excitation[i] *= 0.985;
 
-        velocities[ivx] += (fx + mx) * dt * 60;
-        velocities[ivy] += (fy + my) * dt * 60;
-        velocities[ivx] *= 0.96;
-        velocities[ivy] *= 0.96;
+        const jx = (Math.random() - 0.5) * 0.15;
+        const jy = (Math.random() - 0.5) * 0.15;
+        velocities[ivx] += (fx + mx + jx) * dt * 60;
+        velocities[ivy] += (fy + my + jy) * dt * 60;
+        velocities[ivx] *= 0.98; // less damping — drift further
+        velocities[ivy] *= 0.98;
 
         posArr[ix] += velocities[ivx];
         posArr[iy] += velocities[ivy];
