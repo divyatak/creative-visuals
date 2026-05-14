@@ -250,9 +250,9 @@
     vU.uInfo      = { value: infoTex };
     vU.uDepthTex  = { value: null };           // filled after depthRT exists
     vU.uAspect    = { value: aspect };
-    vU.uStiffness = { value: 8.0 };
-    vU.uDamping   = { value: 0.88 };
-    vU.uAmbient   = { value: 0.012 };
+    vU.uStiffness = { value: 30.0 };
+    vU.uDamping   = { value: 0.965 };
+    vU.uAmbient   = { value: 0.0 };
     vU.uTime      = { value: 0 };
     vU.uDt        = { value: 0 };
 
@@ -281,9 +281,9 @@
       uniforms: {
         uPositionTex: { value: null },
         uVelocityTex: { value: null },
-        uSize:        { value: 7.0 },
+        uSize:        { value: 2.7 },
         uPixelRatio:  { value: renderer.getPixelRatio() },
-        uBrightness:  { value: 0.3 }
+        uBrightness:  { value: 0.35 }
       },
       vertexShader: /* glsl */`
         attribute vec2  reference;
@@ -453,7 +453,7 @@
 
     const bloom = new UnrealBloomPass(
       new THREE.Vector2(window.innerWidth, window.innerHeight),
-      0.0, 0.6, 0.0
+      0.35, 0.6, 0.0
     );
     composer.addPass(bloom);
 
@@ -645,11 +645,11 @@
     const params = {
       mode: 'sheet',
       // particles
-      particleSize: 7.0,
-      brightness: 0.3,
-      speed: 8.0,            // = stiffness (how fast particles chase the target z)
-      damping: 0.88,
-      ambient: 0.012,
+      particleSize: 2.7,
+      brightness: 0.35,
+      speed: 30.0,           // = stiffness (how fast particles chase the target z)
+      damping: 0.965,
+      ambient: 0.0,
       // cursor (sheet mode)
       cursorRadius: 0.42,
       cursorDepth: 0.6,
@@ -658,7 +658,7 @@
       faceSplatRadius: 0.085,
       reliefIntensity: 4.0,
       // post
-      bloomStrength: 0.0,
+      bloomStrength: 0.35,
       bloomRadius: 0.6,
       aberration: 0.0012,
       vignette: 1.10,
