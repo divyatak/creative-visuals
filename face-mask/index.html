@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Particle Face Mask</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #050505; }
+    canvas { display: block; }
+    video#cam { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+    .ui {
+      position: fixed;
+      color: rgba(255,255,255,0.45);
+      font-family: 'SF Mono', 'Consolas', monospace;
+      font-size: 11px;
+      letter-spacing: 1.5px;
+      pointer-events: none;
+      user-select: none;
+      z-index: 10;
+    }
+    .title { top: 24px; left: 300px; }
+    .title .v { color: rgba(255,255,255,0.25); margin-left: 12px; }
+    .hint {
+      bottom: 24px;
+      left: 300px;
+      color: rgba(255,255,255,0.35);
+      font-size: 10px;
+    }
+    .back {
+      top: 24px; right: 28px;
+      pointer-events: auto;
+      color: rgba(255,255,255,0.4);
+      text-decoration: none;
+      letter-spacing: 2px;
+      font-size: 11px;
+      transition: color 0.3s ease;
+    }
+    .back:hover { color: rgba(255,255,255,0.85); }
+
+    .lil-gui.root {
+      --background-color: rgba(12,12,12,0.88);
+      --text-color: rgba(255,255,255,0.85);
+      --title-background-color: rgba(0,0,0,0.55);
+      --title-text-color: rgba(255,255,255,0.7);
+      --widget-color: rgba(255,255,255,0.10);
+      --hover-color: rgba(255,255,255,0.18);
+      --focus-color: rgba(255,255,255,0.28);
+      --number-color: rgba(255,200,150,0.95);
+      --string-color: rgba(150,220,255,0.95);
+      --font-family: 'SF Mono','Consolas',monospace;
+      --font-size: 11px;
+      --input-font-size: 11px;
+      --padding: 8px;
+      --spacing: 4px;
+      --slider-knob-width: 2px;
+      left: 20px; right: auto; top: 20px;
+      width: 260px;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 4px;
+    }
+    .lil-gui .title { letter-spacing: 1.5px; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.20.0/dist/lil-gui.esm.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <video id="cam" autoplay playsinline muted></video>
+  <div class="ui title">PARTICLE FACE MASK <span class="v" id="modeLabel">v2 · sheet</span></div>
+  <div class="ui hint" id="hint">drag your cursor — particles get pushed behind the sheet, like pressing into sand</div>
+  <a class="ui back" href="../">← back</a>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+    import GUI from 'lil-gui';
+
+    // ---------- Config ----------
+    const PARTICLES_DIM = 256;
+    const PARTICLES = PARTICLES_DIM * PARTICLES_DIM;
+
+    // ---- Face feature push points ----
+    // MediaPipe FaceLandmarker indices for features the user named:
+    //   eye corners (outer + inner, both eyes), nose tip, nose bridge, mouth corners.
+    // The MAX_FACE_POINTS constant must match the shader (set to 16 for room to grow).
+    const MAX_FACE_POINTS = 16;
+    const FACE_FEATURE_INDICES = [
+       33,   // right eye, outer corner
+      133,   // right eye, inner corner
+      362,   // left  eye, inner corner
+      263,   // left  eye, outer corner
+        4,   // nose tip
+        1,   // nose bridge / between brows
+       61,   // mouth, right corner
+      291    // mouth, left  corner
+    ];
+    const FACE_FEATURE_COUNT = FACE_FEATURE_INDICES.length;
+
+    const hintEl = document.getElementById('hint');
+    const modeLabelEl = document.getElementById('modeLabel');
+
+    // ---------- Renderer ----------
+    const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x050505, 1);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    document.body.appendChild(renderer.domElement);
+
+    // ---------- Scene ----------
+    let aspect = window.innerWidth / window.innerHeight;
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-aspect, aspect, 1, -1, 0.1, 10);
+    camera.position.z = 1;
+
+    // ---------- GPGPU init textures ----------
+    const gpu = new GPUComputationRenderer(PARTICLES_DIM, PARTICLES_DIM, renderer);
+    if (renderer.capabilities.isWebGL2 === false) gpu.setDataType(THREE.HalfFloatType);
+
+    const posTex  = gpu.createTexture();
+    const velTex  = gpu.createTexture();
+    const infoTex = gpu.createTexture();   // static: wall xy + per-particle seeds
+    initTextures(posTex, velTex, infoTex, aspect);
+
+    // ---------- Face points texture (filled each frame from MediaPipe) ----------
+    // Small DataTexture (MAX_FACE_POINTS × 1) — each texel holds (x, y, z, active) for one feature.
+    // Using a texture (not uniform array) sidesteps GPUComputationRenderer's array-uniform quirks.
+    const facePointsData = new Float32Array(MAX_FACE_POINTS * 4);
+    const facePointsTex = new THREE.DataTexture(
+      facePointsData, MAX_FACE_POINTS, 1, THREE.RGBAFormat, THREE.FloatType
+    );
+    facePointsTex.magFilter = THREE.NearestFilter;
+    facePointsTex.minFilter = THREE.NearestFilter;
+    facePointsTex.needsUpdate = true;
+    function setFacePoint(i, x, y, z, active) {
+      const o = i * 4;
+      facePointsData[o    ] = x;
+      facePointsData[o + 1] = y;
+      facePointsData[o + 2] = z;
+      facePointsData[o + 3] = active;
+    }
+
+    // ---------- Shaders ----------
+    const velocityShader = /* glsl */`
+      #define MAX_FACE_POINTS ${MAX_FACE_POINTS}
+
+      uniform sampler2D uInfo;
+
+      uniform vec2  uCursor;
+      uniform vec2  uCursorVel;
+      uniform float uCursorActive;
+      uniform float uPushRadius;
+      uniform float uPushStrength;
+
+      uniform sampler2D uFacePointsTex;        // MAX_FACE_POINTS × 1 — rgba = xyz + active
+      uniform float uFaceMode;                  // 0 sheet, 1 face
+      uniform float uFaceHas;                   // smoothed face presence
+      uniform float uFacePushRadius;
+      uniform float uFacePushStrength;
+
+      uniform float uStiffness;
+      uniform float uDamping;
+      uniform float uTime;
+      uniform float uDt;
+
+      // ---- Simplex 3D noise (Ashima) ----
+      vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+      vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+      vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+      vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314*r;}
+      float snoise(vec3 v){
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+        vec3 i = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+        vec3 x1 = x0 - i1 + C.xxx;
+        vec3 x2 = x0 - i2 + C.yyy;
+        vec3 x3 = x0 - D.yyy;
+        i = mod289(i);
+        vec4 p = permute(permute(permute(
+                   i.z + vec4(0.0, i1.z, i2.z, 1.0)) +
+                   i.y + vec4(0.0, i1.y, i2.y, 1.0)) +
+                   i.x + vec4(0.0, i1.x, i2.x, 1.0));
+        float n_ = 0.142857142857;
+        vec3 ns = n_ * D.wyz - D.xzx;
+        vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+        vec4 x = x_ * ns.x + ns.yyyy;
+        vec4 y = y_ * ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+      vec2 curl2D(vec2 p, float t){
+        const float e = 0.12;
+        float n1 = snoise(vec3(p.x, p.y + e, t));
+        float n2 = snoise(vec3(p.x, p.y - e, t));
+        float n3 = snoise(vec3(p.x + e, p.y, t));
+        float n4 = snoise(vec3(p.x - e, p.y, t));
+        return vec2(n1 - n2, -(n3 - n4));
+      }
+
+      // ---- One push contribution: a single finger pressing into the sheet at 'center' ----
+      // Returns vec3 force (xy splash + z indent). Always-safe (no branches, gated by 'active').
+      vec3 fingerPush(vec2 particleXy, vec2 center, float radius, float strength, float amount, float salt) {
+        vec2 fromC = particleXy - center;
+        float dist = length(fromC);
+        float falloff = 1.0 - smoothstep(radius * 0.15, radius, dist);
+        falloff = pow(falloff, 1.5) * amount;
+
+        float zPush = -falloff * strength;
+
+        vec2 pushDir = fromC / max(dist, 1e-4);
+        vec2 perp = vec2(-pushDir.y, pushDir.x);
+        float curlMod = curl2D(particleXy * 2.4 + salt, uTime * 0.32).x;
+        vec2 sweep = pushDir * 0.45 + perp * curlMod * 0.55;
+        float ring = falloff * (1.0 - falloff * 0.6);
+        vec2 xyPush = sweep * ring * strength * 0.55;
+
+        return vec3(xyPush, zPush);
+      }
+
+      void main(){
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 pos = texture2D(positionTexture, uv);
+        vec4 vel = texture2D(velocityTexture, uv);
+        vec4 info = texture2D(uInfo, uv);
+
+        vec2  wallPos = info.rg;
+        float seed    = info.a;
+
+        // ---- Spring back to wall (sheet always wants to be flat) ----
+        vec3 home = vec3(wallPos, 0.0);
+        vec3 toHome = home - pos.xyz;
+        float distFromHome = length(toHome.xy);
+        float stiffXY = uStiffness * (0.9 + 0.7 * smoothstep(0.0, 0.35, distFromHome));
+        float stiffZ  = uStiffness * 1.1;
+        vec3 spring = vec3(toHome.xy * stiffXY, toHome.z * stiffZ);
+
+        // Ambient curl noise drift (gentle, so the wall isn't dead-still)
+        vec2 cn = curl2D(pos.xy * 1.3 + seed * 7.0, uTime * 0.22);
+        vec3 swirl = vec3(cn * 0.18, 0.0);
+
+        // ---- Cursor finger (sheet mode) ----
+        float sheetMode = 1.0 - uFaceMode;
+        vec3 push = vec3(0.0);
+
+        // Cursor push uses the bow-wave perpendicular nudge from cursor motion
+        vec2 cFrom = pos.xy - uCursor;
+        float cDist = length(cFrom);
+        float cFall = pow(1.0 - smoothstep(uPushRadius * 0.15, uPushRadius, cDist), 1.5) * uCursorActive * sheetMode;
+        {
+          vec2 pushDir = cFrom / max(cDist, 1e-4);
+          vec2 perp = vec2(-pushDir.y, pushDir.x);
+          float curlMod = curl2D(pos.xy * 2.4 + seed * 5.0, uTime * 0.32).x;
+          vec2 sweep = pushDir * 0.45 + perp * curlMod * 0.55;
+          float vlen = length(uCursorVel);
+          if (vlen > 1e-4) {
+            vec2 motionDir = uCursorVel / vlen;
+            vec2 motionPerp = vec2(-motionDir.y, motionDir.x);
+            float side = sign(dot(pushDir, motionPerp));
+            sweep += motionPerp * side * 0.3;
+          }
+          float ring = cFall * (1.0 - cFall * 0.6);
+          vec2 xyPush = sweep * ring * uPushStrength * 0.55;
+          float zPush = -cFall * uPushStrength;
+          push += vec3(xyPush, zPush);
+        }
+
+        // ---- Face features (face mode): each landmark is its own finger ----
+        float faceGate = uFaceMode * uFaceHas;
+        for (int i = 0; i < MAX_FACE_POINTS; i++) {
+          vec2 fpUv = vec2((float(i) + 0.5) / float(MAX_FACE_POINTS), 0.5);
+          vec4 fp = texture2D(uFacePointsTex, fpUv);
+          float amount = fp.w * faceGate;
+          // Per-feature salt for distinct curl-noise on each — keeps trench edges from syncing
+          float salt = float(i) * 1.71 + seed * 0.3;
+          push += fingerPush(pos.xy, fp.xy, uFacePushRadius, uFacePushStrength, amount, salt);
+        }
+
+        // ---- Compose ----
+        vec3 acc = spring + swirl + push;
+        vec3 newVel = vel.xyz * uDamping + acc * uDt;
+
+        float spd = length(newVel);
+        float maxSpd = 6.5;
+        if (spd > maxSpd) newVel = newVel * (maxSpd / spd);
+
+        gl_FragColor = vec4(newVel, 0.0);
+      }
+    `;
+
+    const positionShader = /* glsl */`
+      uniform float uDt;
+      void main(){
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 pos = texture2D(positionTexture, uv);
+        vec4 vel = texture2D(velocityTexture, uv);
+        pos.xyz += vel.xyz * uDt;
+        gl_FragColor = pos;
+      }
+    `;
+
+    const positionVar = gpu.addVariable('positionTexture', positionShader, posTex);
+    const velocityVar = gpu.addVariable('velocityTexture', velocityShader, velTex);
+    gpu.setVariableDependencies(positionVar, [positionVar, velocityVar]);
+    gpu.setVariableDependencies(velocityVar, [positionVar, velocityVar]);
+
+    positionVar.material.uniforms.uDt = { value: 0 };
+
+    const vU = velocityVar.material.uniforms;
+    vU.uDt            = { value: 0 };
+    vU.uTime          = { value: 0 };
+    vU.uCursor        = { value: new THREE.Vector2(999, 999) };
+    vU.uCursorVel     = { value: new THREE.Vector2() };
+    vU.uCursorActive  = { value: 0 };
+    vU.uPushRadius    = { value: 0.25 };
+    vU.uPushStrength  = { value: 5.0 };
+    vU.uFaceMode      = { value: 0 };
+    vU.uFaceHas       = { value: 0 };
+    vU.uFacePointsTex    = { value: facePointsTex };
+    vU.uFacePushRadius   = { value: 0.10 };
+    vU.uFacePushStrength = { value: 4.5 };
+    vU.uStiffness     = { value: 6.0 };
+    vU.uDamping       = { value: 0.905 };
+    vU.uInfo          = { value: infoTex };
+
+    const initErr = gpu.init();
+    if (initErr) console.error('GPUComputationRenderer init error:', initErr);
+
+    // ---------- Particle render mesh ----------
+    const particleGeo = new THREE.BufferGeometry();
+    const positions = new Float32Array(PARTICLES * 3);
+    const refs      = new Float32Array(PARTICLES * 2);
+    const seeds     = new Float32Array(PARTICLES);
+    for (let i = 0; i < PARTICLES; i++) {
+      const x = i % PARTICLES_DIM;
+      const y = (i / PARTICLES_DIM) | 0;
+      refs[i*2]   = (x + 0.5) / PARTICLES_DIM;
+      refs[i*2+1] = (y + 0.5) / PARTICLES_DIM;
+      seeds[i]    = Math.random();
+    }
+    particleGeo.setAttribute('position',  new THREE.BufferAttribute(positions, 3));
+    particleGeo.setAttribute('reference', new THREE.BufferAttribute(refs, 2));
+    particleGeo.setAttribute('aSeed',     new THREE.BufferAttribute(seeds, 1));
+
+    const particleMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uPositionTex: { value: null },
+        uVelocityTex: { value: null },
+        uSize:        { value: 7.0 },
+        uPixelRatio:  { value: renderer.getPixelRatio() },
+        uTime:        { value: 0 },
+        uBrightness:  { value: 0.3 }
+      },
+      vertexShader: /* glsl */`
+        attribute vec2  reference;
+        attribute float aSeed;
+        uniform sampler2D uPositionTex;
+        uniform sampler2D uVelocityTex;
+        uniform float uSize;
+        uniform float uPixelRatio;
+        varying float vSpeed;
+        varying float vSeed;
+        varying float vDepth;
+        void main(){
+          vec4 pos = texture2D(uPositionTex, reference);
+          vec4 vel = texture2D(uVelocityTex, reference);
+          vSpeed = length(vel.xyz);
+          vSeed  = aSeed;
+          vDepth = pos.z;
+
+          vec4 mvPosition = modelViewMatrix * vec4(pos.x, pos.y, 0.0, 1.0);
+          gl_Position = projectionMatrix * mvPosition;
+
+          float sz = uSize * (0.75 + 0.5 * aSeed);
+          float depthScale = clamp(1.0 + pos.z * 0.6, 0.4, 1.5);
+          gl_PointSize = sz * uPixelRatio * depthScale;
+        }
+      `,
+      fragmentShader: /* glsl */`
+        varying float vSpeed;
+        varying float vSeed;
+        varying float vDepth;
+        uniform float uBrightness;
+        void main(){
+          vec2 c = gl_PointCoord * 2.0 - 1.0;
+          c.y = -c.y;
+          float r2 = dot(c, c);
+          if (r2 > 1.0) discard;
+          float nz = sqrt(1.0 - r2);
+          vec3 N = vec3(c, nz);
+
+          vec3 keyL  = normalize(vec3( 0.45,  0.55, 0.7));
+          vec3 fillL = normalize(vec3(-0.35, -0.4 , 0.5));
+          float key  = max(dot(N, keyL),  0.0);
+          float fill = max(dot(N, fillL), 0.0);
+          float spec = pow(max(dot(N, keyL), 0.0), 28.0);
+
+          vec3 cold = vec3(0.62, 0.55, 0.45);
+          vec3 warm = vec3(1.10, 0.85, 0.55);
+          vec3 hot  = vec3(1.55, 1.25, 0.95);
+          float heat = clamp(vSpeed * 1.8, 0.0, 1.0);
+          vec3 base = mix(cold, warm, heat);
+          base = mix(base, hot, smoothstep(0.5, 1.0, heat));
+          base *= 0.92 + 0.16 * vSeed;
+
+          float depthShade = clamp(1.0 + vDepth * 0.65, 0.30, 1.20);
+          vec3 col = base * (0.22 + 0.9 * key + 0.25 * fill) * depthShade;
+          col += vec3(0.95, 0.85, 0.75) * spec * 0.55 * depthShade;
+
+          float a = smoothstep(1.0, 0.88, r2);
+          gl_FragColor = vec4(col * uBrightness, a);
+        }
+      `,
+      blending: THREE.AdditiveBlending,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false
+    });
+
+    const points = new THREE.Points(particleGeo, particleMat);
+    points.frustumCulled = false;
+    scene.add(points);
+
+    // ---------- Post-processing ----------
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.0, 0.6, 0.0
+    );
+    composer.addPass(bloom);
+
+    const finishPass = new ShaderPass({
+      uniforms: {
+        tDiffuse:    { value: null },
+        uTime:       { value: 0 },
+        uAberration: { value: 0.0012 },
+        uVignette:   { value: 1.10 },
+        uGrain:      { value: 0.040 }
+      },
+      vertexShader: /* glsl */`
+        varying vec2 vUv;
+        void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+      `,
+      fragmentShader: /* glsl */`
+        uniform sampler2D tDiffuse;
+        uniform float uTime;
+        uniform float uAberration;
+        uniform float uVignette;
+        uniform float uGrain;
+        varying vec2 vUv;
+        float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+        void main(){
+          vec2 uv = vUv;
+          vec2 dir = uv - 0.5;
+          float fall = dot(dir, dir);
+          float aber = uAberration * (1.0 + fall * 3.5);
+          float r = texture2D(tDiffuse, uv - dir * aber).r;
+          float g = texture2D(tDiffuse, uv).g;
+          float b = texture2D(tDiffuse, uv + dir * aber).b;
+          vec3 col = vec3(r, g, b);
+          float vig = 1.0 - fall * uVignette;
+          vig = clamp(vig, 0.0, 1.0);
+          col *= mix(0.4, 1.0, pow(vig, 1.4));
+          float n = hash(gl_FragCoord.xy + uTime * 73.0) - 0.5;
+          col += n * uGrain;
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `
+    });
+    composer.addPass(finishPass);
+    composer.addPass(new OutputPass());
+
+    // ---------- Input (sheet mode) ----------
+    const cursor       = new THREE.Vector2(999, 999);
+    const cursorPrev   = new THREE.Vector2(999, 999);
+    const cursorVel    = new THREE.Vector2();
+    let   cursorEver   = false;
+
+    function setCursorFromEvent(clientX, clientY) {
+      cursor.x = (clientX / window.innerWidth  - 0.5) * 2 * aspect;
+      cursor.y = -(clientY / window.innerHeight - 0.5) * 2;
+      cursorEver = true;
+    }
+    window.addEventListener('mousemove', e => setCursorFromEvent(e.clientX, e.clientY));
+    window.addEventListener('mouseleave', () => { cursorEver = false; });
+    window.addEventListener('touchmove', e => {
+      if (e.touches[0]) setCursorFromEvent(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: true });
+    window.addEventListener('touchend', () => { cursorEver = false; });
+
+    // ---------- Resize ----------
+    window.addEventListener('resize', () => {
+      aspect = window.innerWidth / window.innerHeight;
+      camera.left = -aspect; camera.right = aspect; camera.top = 1; camera.bottom = -1;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
+      bloom.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ---------- MediaPipe FaceLandmarker ----------
+    let faceLandmarker = null;
+    let faceVideo = document.getElementById('cam');
+    let faceLoading = false;
+    let faceReady = false;
+    let lastFaceVideoTime = -1;
+
+    async function ensureFaceMode() {
+      if (faceReady || faceLoading) return;
+      faceLoading = true;
+      hintEl.textContent = 'loading face tracking…';
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: 'user' },
+          audio: false
+        });
+        faceVideo.srcObject = stream;
+        await new Promise((res, rej) => {
+          faceVideo.onloadedmetadata = res;
+          faceVideo.onerror = rej;
+        });
+        await faceVideo.play();
+
+        const { FaceLandmarker, FilesetResolver } = await import(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs'
+        );
+        const vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'GPU'
+          },
+          runningMode: 'VIDEO',
+          numFaces: 1
+        });
+        faceReady = true;
+        faceLoading = false;
+        hintEl.textContent = 'show your face — eyes, nose, mouth poke the sheet';
+      } catch (err) {
+        console.error('face mode init failed', err);
+        hintEl.textContent = 'face tracking unavailable — using sheet mode';
+        faceLoading = false;
+        params.mode = 'sheet';
+        vU.uFaceMode.value = 0;
+        modeLabelEl.textContent = 'v2 · sheet';
+        gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+    }
+
+    // Pull the curated landmark indices and write them into facePointsTex (world coords).
+    function updateFacePoints(now) {
+      if (!faceReady) return false;
+      if (faceVideo.currentTime === lastFaceVideoTime) return null;  // no new frame
+      lastFaceVideoTime = faceVideo.currentTime;
+      const result = faceLandmarker.detectForVideo(faceVideo, now);
+      if (!result.faceLandmarks || result.faceLandmarks.length === 0) {
+        for (let i = 0; i < MAX_FACE_POINTS; i++) setFacePoint(i, 0, 0, 0, 0);
+        facePointsTex.needsUpdate = true;
+        return false;
+      }
+      const lm = result.faceLandmarks[0];
+      const scale = params.faceScale;
+      for (let i = 0; i < FACE_FEATURE_COUNT; i++) {
+        const idx = FACE_FEATURE_INDICES[i];
+        const p = lm[idx];
+        if (!p) { setFacePoint(i, 0, 0, 0, 0); continue; }
+        const wx = (0.5 - p.x) * 2 * aspect * scale;
+        const wy = -(p.y - 0.5) * 2 * scale;
+        const wz = -p.z * 1.8;
+        setFacePoint(i, wx, wy, wz, 1);
+      }
+      for (let i = FACE_FEATURE_COUNT; i < MAX_FACE_POINTS; i++) setFacePoint(i, 0, 0, 0, 0);
+      facePointsTex.needsUpdate = true;
+      return true;
+    }
+
+    // ---------- Control panel ----------
+    const params = {
+      mode: 'sheet',
+      particleSize: 7.0,
+      brightness: 0.3,
+      stiffness: 6.0,
+      damping: 0.905,
+
+      pushRadius: 0.25,
+      pushStrength: 5.0,
+
+      faceScale: 1.7,
+      facePushRadius: 0.10,
+      facePushStrength: 4.5,
+
+      bloomStrength: 0.0,
+      bloomRadius: 0.6,
+      aberration: 0.0012,
+      vignette: 1.10,
+      grain: 0.040,
+      exposure: 1.0
+    };
+
+    const gui = new GUI({ title: 'CONTROLS' });
+
+    gui.add(params, 'mode', ['sheet', 'face']).name('mode').onChange(v => {
+      if (v === 'face') {
+        modeLabelEl.textContent = 'v2 · face';
+        ensureFaceMode();
+        vU.uFaceMode.value = 1;
+      } else {
+        modeLabelEl.textContent = 'v2 · sheet';
+        hintEl.textContent = 'drag your cursor — particles get pushed behind the sheet, like pressing into sand';
+        vU.uFaceMode.value = 0;
+      }
+    });
+
+    const fSim = gui.addFolder('particles');
+    fSim.add(params, 'particleSize', 1.0, 10.0, 0.1).name('size').onChange(v => particleMat.uniforms.uSize.value = v);
+    fSim.add(params, 'brightness', 0.3, 2.5, 0.05).onChange(v => particleMat.uniforms.uBrightness.value = v);
+    fSim.add(params, 'stiffness', 1.0, 15.0, 0.1).onChange(v => vU.uStiffness.value = v);
+    fSim.add(params, 'damping', 0.7, 0.99, 0.005).onChange(v => vU.uDamping.value = v);
+
+    const fSheet = gui.addFolder('sheet (cursor)');
+    fSheet.add(params, 'pushRadius', 0.05, 0.6, 0.005).onChange(v => vU.uPushRadius.value = v);
+    fSheet.add(params, 'pushStrength', 0.5, 15.0, 0.1).onChange(v => vU.uPushStrength.value = v);
+
+    const fFace = gui.addFolder('face features');
+    fFace.add(params, 'faceScale', 0.6, 3.5, 0.05).name('face scale');
+    fFace.add(params, 'facePushRadius', 0.02, 0.25, 0.005).name('feature radius').onChange(v => vU.uFacePushRadius.value = v);
+    fFace.add(params, 'facePushStrength', 0.5, 15.0, 0.1).name('feature strength').onChange(v => vU.uFacePushStrength.value = v);
+
+    const fPost = gui.addFolder('post');
+    fPost.add(params, 'bloomStrength', 0.0, 2.5, 0.05).name('bloom').onChange(v => bloom.strength = v);
+    fPost.add(params, 'bloomRadius', 0.0, 1.5, 0.05).name('bloom radius').onChange(v => bloom.radius = v);
+    fPost.add(params, 'aberration', 0.0, 0.01, 0.0002).name('chromatic ab.').onChange(v => finishPass.uniforms.uAberration.value = v);
+    fPost.add(params, 'vignette', 0.0, 2.5, 0.05).onChange(v => finishPass.uniforms.uVignette.value = v);
+    fPost.add(params, 'grain', 0.0, 0.2, 0.005).onChange(v => finishPass.uniforms.uGrain.value = v);
+    fPost.add(params, 'exposure', 0.3, 2.5, 0.05).onChange(v => renderer.toneMappingExposure = v);
+
+    // ---------- Main loop ----------
+    let lastT = performance.now();
+    function tick(now){
+      requestAnimationFrame(tick);
+      const dt = Math.min(0.05, (now - lastT) / 1000);
+      lastT = now;
+      const tSec = now * 0.001;
+
+      // Cursor velocity (smoothed) — drives the sheet-mode bow-wave
+      if (cursorEver && dt > 0) {
+        const ivx = (cursor.x - cursorPrev.x) / dt;
+        const ivy = (cursor.y - cursorPrev.y) / dt;
+        cursorVel.x += (ivx - cursorVel.x) * Math.min(1, dt * 12);
+        cursorVel.y += (ivy - cursorVel.y) * Math.min(1, dt * 12);
+      } else {
+        cursorVel.multiplyScalar(0.85);
+      }
+      cursorPrev.copy(cursor);
+
+      const cursorWant = cursorEver ? 1 : 0;
+      const cAct = vU.uCursorActive.value;
+      vU.uCursorActive.value = cAct + (cursorWant - cAct) * Math.min(1, dt * (cursorWant ? 8 : 2.5));
+
+      // Face features
+      let faceWant = 0;
+      if (params.mode === 'face' && faceReady) {
+        const got = updateFacePoints(now);
+        if (got === true) faceWant = 1;
+        else if (got === null) faceWant = vU.uFaceHas.value;  // no new frame; hold
+        else faceWant = 0;
+      } else {
+        // ensure points are inactive when not in face mode
+        let anyActive = false;
+        for (let i = 0; i < MAX_FACE_POINTS; i++) {
+          if (facePointsData[i*4 + 3] !== 0) { facePointsData[i*4 + 3] = 0; anyActive = true; }
+        }
+        if (anyActive) facePointsTex.needsUpdate = true;
+      }
+      const fHas = vU.uFaceHas.value;
+      vU.uFaceHas.value = fHas + (faceWant - fHas) * Math.min(1, dt * (faceWant ? 6 : 2.5));
+
+      vU.uDt.value          = dt;
+      vU.uTime.value        = tSec;
+      vU.uCursor.value.copy(cursor);
+      vU.uCursorVel.value.copy(cursorVel);
+      positionVar.material.uniforms.uDt.value = dt;
+
+      gpu.compute();
+
+      particleMat.uniforms.uPositionTex.value = gpu.getCurrentRenderTarget(positionVar).texture;
+      particleMat.uniforms.uVelocityTex.value = gpu.getCurrentRenderTarget(velocityVar).texture;
+      particleMat.uniforms.uTime.value = tSec;
+      finishPass.uniforms.uTime.value = tSec;
+
+      composer.render();
+    }
+    requestAnimationFrame(tick);
+
+    // ---------- Texture init ----------
+    function initTextures(posT, velT, infoT, aspect){
+      const posA  = posT.image.data;
+      const velA  = velT.image.data;
+      const infoA = infoT.image.data;
+
+      const cols = Math.round(Math.sqrt(PARTICLES * aspect));
+      const rows = Math.ceil(PARTICLES / cols);
+
+      let i = 0;
+      for (let r = 0; r < rows && i < PARTICLES; r++) {
+        for (let c = 0; c < cols && i < PARTICLES; c++) {
+          const u = (c + Math.random() * 0.85 + 0.075) / cols;
+          const v = (r + Math.random() * 0.85 + 0.075) / rows;
+          const wx = (u - 0.5) * 2 * aspect;
+          const wy = (v - 0.5) * 2;
+
+          const idx = i * 4;
+          posA[idx + 0] = wx;
+          posA[idx + 1] = wy;
+          posA[idx + 2] = 0;
+          posA[idx + 3] = Math.random();
+
+          velA[idx + 0] = 0;
+          velA[idx + 1] = 0;
+          velA[idx + 2] = 0;
+          velA[idx + 3] = 0;
+
+          // info: rg = wall pos, b = unused for now, a = seed
+          infoA[idx + 0] = wx;
+          infoA[idx + 1] = wy;
+          infoA[idx + 2] = 0;
+          infoA[idx + 3] = Math.random();
+
+          i++;
+        }
+      }
+    }
+  </script>
+</body>
+</html>
