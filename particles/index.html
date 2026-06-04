@@ -106,6 +106,26 @@
     try { Object.assign(params, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {}
     const saveParams = () => { try { localStorage.setItem(STORE_KEY, JSON.stringify(params)); } catch (e) {} };
 
+    // ── Hand appearance/shape — live-tunable, persisted separately ──
+    const HAND_DEFAULTS = {
+      fingerThick: 0.94,  // finger/thumb thickness multiplier
+      baseMul:     1.00,  // knuckle-end thickness multiplier
+      tipMul:      0.70,  // fingertip-end thickness multiplier
+      blend:       0.00,  // finger↔palm smooth-union (0 = crisp, higher = webbed)
+      palmRound:   0.12,  // palm size / roundness (× hand span)
+      edgeSoft:    2.00,  // outline softness multiplier
+      fill:        0.66,  // body opacity
+      rim:         1.38,  // edge-glow strength
+      halo:        0.29,  // soft outer halo strength
+      hue:         0.69,  // colour hue (0..1)
+      sat:         0.60,  // saturation
+      light:       0.16   // lightness
+    };
+    const HAND_STORE_KEY = 'biolum-hand-v1';
+    const handParams = Object.assign({}, HAND_DEFAULTS);
+    try { Object.assign(handParams, JSON.parse(localStorage.getItem(HAND_STORE_KEY) || '{}')); } catch (e) {}
+    const saveHandParams = () => { try { localStorage.setItem(HAND_STORE_KEY, JSON.stringify(handParams)); } catch (e) {} };
+
     // ══════════════════════════════════════════════
     // RENDERER + CAMERA
     // ══════════════════════════════════════════════
@@ -189,19 +209,23 @@
       { idx: [13, 14, 15, 16], base: 0.135 }, // ring
       { idx: [17, 18, 19, 20], base: 0.115 }  // pinky
     ];
-    const TAPER = [1.0, 0.9, 0.8, 0.7];   // radius multiplier base→tip
     const PALM = [0, 1, 5, 9, 13, 17];    // boundary: wrist→thumb base→knuckles→pinky
-    const PALM_ROUND = 0.17;              // palm inflation (fraction of hand span)
+    // (finger taper & palm-round are now live uniforms — see HAND_DEFAULTS)
 
     // Emit the SDF body (declares float d) for point-array P and scale S,
     // using literal indices only (GLSL ES 1.00 safe). The point var is `p`.
-    function genSDFBody(P, S) {
+    // P=points array, S=hand-span uniform. U = uniform names:
+    //   thick (global), palm (round), blend (finger↔palm smin), baseMul/tipMul (taper)
+    function genSDFBody(P, S, U) {
       let g = 'float d = 1e5;\n';
       for (const f of FINGERS) {
+        const rb = f.base.toFixed(4);
         for (let s = 0; s < 3; s++) {
           const a = f.idx[s], b = f.idx[s+1];
-          const ra = (f.base * TAPER[s]).toFixed(4), rb = (f.base * TAPER[s+1]).toFixed(4);
-          g += `d = min(d, sdRoundCone(p, ${P}[${a}], ${P}[${b}], ${ra}*${S}, ${rb}*${S}));\n`;
+          const fa = (s/3).toFixed(3), fb = ((s+1)/3).toFixed(3);
+          g += `d = min(d, sdRoundCone(p, ${P}[${a}], ${P}[${b}], `
+            +  `${rb}*${S}*${U.thick}*mix(${U.baseMul},${U.tipMul},${fa}), `
+            +  `${rb}*${S}*${U.thick}*mix(${U.baseMul},${U.tipMul},${fb})));\n`;
         }
       }
       g += `float dp = dot(p-${P}[${PALM[0]}], p-${P}[${PALM[0]}]); float sp = 1.0;\n`;
@@ -212,12 +236,15 @@
           +  ` bvec3 c=bvec3(p.y>=${P}[${vi}].y, p.y<${P}[${vj}].y, e.x*w.y>e.y*w.x);`
           +  ` if(all(c)||all(not(c))) sp=-sp; }\n`;
       }
-      g += `d = min(d, sp*sqrt(dp) - ${PALM_ROUND.toFixed(4)}*${S});\n`;
+      // fingers blend into the palm via smooth-union (k≈0 → crisp hard union)
+      g += `float dPalm = sp*sqrt(dp) - ${U.palm}*${S};\n`;
+      g += `d = smin(d, dPalm, max(${U.blend}*${S}, 0.5));\n`;
       return g;
     }
     const SD_ROUNDCONE = `float sdRoundCone(vec2 p, vec2 a, vec2 b, float ra, float rb){ vec2 ba=b-a; float l2=max(dot(ba,ba),1e-4); float t=clamp(dot(p-a,ba)/l2,0.0,1.0); return length(p-(a+t*ba))-mix(ra,rb,t); }`;
+    const SMIN = `float smin(float a, float b, float k){ float h=clamp(0.5+0.5*(b-a)/k,0.0,1.0); return mix(b,a,h)-k*h*(1.0-h); }`;
     const INBOX = `bool inBox(vec2 p, vec4 b){ return p.x>=b.x && p.y>=b.y && p.x<=b.z && p.y<=b.w; }`;
-    const genSDF = (fn, P, S) => `float ${fn}(vec2 p){ ${genSDFBody(P, S)} return d; }`;
+    const genSDF = (fn, P, S, U) => `float ${fn}(vec2 p){ ${genSDFBody(P, S, U)} return d; }`;
     // edge-repulsion block: push a particle along the SDF gradient, strongest inside
     const genPush = (sdf) => `
           { float d0 = ${sdf}(pos);
@@ -285,15 +312,17 @@
     const posFrag = `
       uniform float uTime, uDt, uW, uH, uFlowStr, uFlowScale, uFlowSpeed, uRadBase;
       uniform float uDamping, uJitter, uRepelRad, uRepelStr;
+      uniform float uHandThick, uHandPalm, uHandBlend, uHandBaseMul, uHandTipMul;
       uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
       uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
       uniform vec2 uMouse; uniform float uMouseOn;
       ${GLSL_HASH}
       ${GLSL_FLOW}
       ${SD_ROUNDCONE}
+      ${SMIN}
       ${INBOX}
-      ${genSDF('handSDF0', 'uHand0Pts', 'uHand0Scale')}
-      ${genSDF('handSDF1', 'uHand1Pts', 'uHand1Scale')}
+      ${genSDF('handSDF0', 'uHand0Pts', 'uHand0Scale', { thick:'uHandThick', palm:'uHandPalm', blend:'uHandBlend', baseMul:'uHandBaseMul', tipMul:'uHandTipMul' })}
+      ${genSDF('handSDF1', 'uHand1Pts', 'uHand1Scale', { thick:'uHandThick', palm:'uHandPalm', blend:'uHandBlend', baseMul:'uHandBaseMul', tipMul:'uHandTipMul' })}
       void main(){
         vec2 uv = gl_FragCoord.xy / resolution.xy;
         vec4 P = texture2D(texPos, uv);
@@ -353,14 +382,16 @@
     // ── Age / excitation / hue step ──
     const dataFrag = `
       uniform float uTime, uDt, uRadBase, uRepelRad;
+      uniform float uHandThick, uHandPalm, uHandBlend, uHandBaseMul, uHandTipMul;
       uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
       uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
       uniform vec2 uMouse; uniform float uMouseOn;
       ${GLSL_HASH}
       ${SD_ROUNDCONE}
+      ${SMIN}
       ${INBOX}
-      ${genSDF('handSDF0', 'uHand0Pts', 'uHand0Scale')}
-      ${genSDF('handSDF1', 'uHand1Pts', 'uHand1Scale')}
+      ${genSDF('handSDF0', 'uHand0Pts', 'uHand0Scale', { thick:'uHandThick', palm:'uHandPalm', blend:'uHandBlend', baseMul:'uHandBaseMul', tipMul:'uHandTipMul' })}
+      ${genSDF('handSDF1', 'uHand1Pts', 'uHand1Scale', { thick:'uHandThick', palm:'uHandPalm', blend:'uHandBlend', baseMul:'uHandBaseMul', tipMul:'uHandTipMul' })}
       void main(){
         vec2 uv = gl_FragCoord.xy / resolution.xy;
         vec4 P = texture2D(texPos, uv);
@@ -418,11 +449,15 @@
       uFlowSpeed: { value: params.flowSpeed }, uRadBase: { value: 60 },
       uDamping: { value: params.damping }, uJitter: { value: params.jitter },
       uRepelRad: { value: params.repelRad }, uRepelStr: { value: params.repelStr },
+      uHandThick: { value: handParams.fingerThick }, uHandPalm: { value: handParams.palmRound },
+      uHandBlend: { value: handParams.blend }, uHandBaseMul: { value: handParams.baseMul }, uHandTipMul: { value: handParams.tipMul },
       ...handUniforms()
     });
     Object.assign(dataVar.material.uniforms, {
       uTime: { value: 0 }, uDt: { value: 0.016 },
       uRadBase: { value: 60 }, uRepelRad: { value: params.repelRad },
+      uHandThick: { value: handParams.fingerThick }, uHandPalm: { value: handParams.palmRound },
+      uHandBlend: { value: handParams.blend }, uHandBaseMul: { value: handParams.baseMul }, uHandTipMul: { value: handParams.tipMul },
       ...handUniforms()
     });
 
@@ -537,18 +572,20 @@
       uniform vec2 uPts[21];
       uniform float uScale;   // hand span (px)
       uniform float uAA;      // edge softness (px)
+      uniform float uThick, uPalmRound, uBlend, uBaseMul, uTipMul, uFill, uRim, uHalo;
       uniform vec3 uColor;
       varying vec2 vWorld;
       ${SD_ROUNDCONE}
-      ${genSDF('handSDF', 'uPts', 'uScale')}
+      ${SMIN}
+      ${genSDF('handSDF', 'uPts', 'uScale', { thick:'uThick', palm:'uPalmRound', blend:'uBlend', baseMul:'uBaseMul', tipMul:'uTipMul' })}
       void main(){
         vec2 p = vWorld;
         float d = handSDF(p);
         float inside = smoothstep(uAA, -uAA, d);             // crisp solid fill
         float rim    = smoothstep(0.05*uScale, 0.0, abs(d)); // bright edge band
         float outer  = exp(max(d, 0.0) / -(0.05*uScale));    // soft halo
-        vec3 col = uColor * (0.5 + rim*1.0);
-        float alpha = inside*0.72 + outer*0.16;
+        vec3 col = uColor * (0.5 + rim*uRim);
+        float alpha = inside*uFill + outer*uHalo;
         if (alpha < 0.003) discard;
         gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
       }
@@ -568,7 +605,10 @@
           uPts:   { value: handPts[handIdx] }, // shared with the particle sim
           uScale: { value: 100 },
           uAA:    { value: 2 },
-          uColor: { value: new THREE.Color(0.30, 0.78, 0.88) }
+          uThick: { value: handParams.fingerThick }, uPalmRound: { value: handParams.palmRound },
+          uBlend: { value: handParams.blend }, uBaseMul: { value: handParams.baseMul }, uTipMul: { value: handParams.tipMul },
+          uFill:  { value: handParams.fill }, uRim: { value: handParams.rim }, uHalo: { value: handParams.halo },
+          uColor: { value: new THREE.Color() }
         },
         vertexShader: handVert,
         fragmentShader: handFrag,
@@ -616,7 +656,7 @@
       const dx = midX - wristX, dy = midY - wristY;
       const span = Math.max(40, Math.sqrt(dx*dx + dy*dy));
       u.uScale.value = span;
-      u.uAA.value = Math.max(1.5, 0.02 * span);
+      u.uAA.value = Math.max(1.5, 0.02 * span) * handParams.edgeSoft;
 
       const margin = 0.5 * span; // room for palm rounding + tip radius + halo
       const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
@@ -718,6 +758,24 @@
       pMat.uniforms.uAlpha.value = params.alpha;
     }
 
+    // Push live hand appearance/shape params into all relevant uniforms.
+    const _handColor = new THREE.Color();
+    function applyHandParams() {
+      const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
+      for (const U of [pu, du]) {
+        U.uHandThick.value = handParams.fingerThick; U.uHandPalm.value = handParams.palmRound;
+        U.uHandBlend.value = handParams.blend; U.uHandBaseMul.value = handParams.baseMul; U.uHandTipMul.value = handParams.tipMul;
+      }
+      _handColor.setHSL(handParams.hue, handParams.sat, handParams.light);
+      for (const m of handMeshes) {
+        const u = m.material.uniforms;
+        u.uThick.value = handParams.fingerThick; u.uPalmRound.value = handParams.palmRound;
+        u.uBlend.value = handParams.blend; u.uBaseMul.value = handParams.baseMul; u.uTipMul.value = handParams.tipMul;
+        u.uFill.value = handParams.fill; u.uRim.value = handParams.rim; u.uHalo.value = handParams.halo;
+        u.uColor.value.copy(_handColor);
+      }
+    }
+
     // Push hand/mouse interaction state into a sim material's uniforms.
     function setHandUniforms(U) {
       U.uHand0On.value = handInfo[0].on; U.uHand0Scale.value = handInfo[0].scale; U.uHand0Box.value.copy(handInfo[0].box);
@@ -758,6 +816,7 @@
       pu.uTime.value = time; pu.uDt.value = dt; pu.uRadBase.value = mouseRadBase;
       du.uTime.value = time; du.uDt.value = dt; du.uRadBase.value = mouseRadBase;
       applyParams();
+      applyHandParams();
       setHandUniforms(pu);
       setHandUniforms(du);
 
@@ -817,44 +876,46 @@
     // ══════════════════════════════════════════════
     // CONTROL PANEL (live tuning, persisted to localStorage)
     // ══════════════════════════════════════════════
-    const CONTROLS = [
-      { key: 'baseGlow',   label: 'Base glow',          min: 0,    max: 0.5,  step: 0.01  },
-      { key: 'excGlow',    label: 'Excited glow',       min: 0,    max: 1.5,  step: 0.01  },
-      { key: 'alpha',      label: 'Overall brightness', min: 0.5,  max: 3,    step: 0.01  },
-      { key: 'flowStr',    label: 'Base movement',      min: 0,    max: 0.6,  step: 0.01  },
-      { key: 'flowSpeed',  label: 'Base speed',         min: 0,    max: 1.5,  step: 0.01  },
-      { key: 'damping',    label: 'Floatiness',         min: 0.90, max: 0.99, step: 0.001 },
-      { key: 'jitter',     label: 'Shimmer',            min: 0,    max: 0.3,  step: 0.005 },
-      { key: 'trail',      label: 'Trail length',       min: 0.80, max: 0.99, step: 0.005 },
-      { key: 'handSmooth', label: 'Hand smoothing',     min: 0.05, max: 1,    step: 0.01  },
-      { key: 'repelRad',   label: 'Repulsion radius',   min: 0.05, max: 0.6,  step: 0.01  },
-      { key: 'repelStr',   label: 'Repulsion strength', min: 0,    max: 1.2,  step: 0.01  }
+    const HAND_CONTROLS = [
+      { key: 'fingerThick', label: 'Finger thickness',  min: 0.4,  max: 2.0,  step: 0.01  },
+      { key: 'baseMul',     label: 'Knuckle thickness', min: 0.4,  max: 1.8,  step: 0.01  },
+      { key: 'tipMul',      label: 'Fingertip thickness',min: 0.2, max: 1.6,  step: 0.01  },
+      { key: 'blend',       label: 'Finger–palm blend', min: 0,    max: 0.5,  step: 0.005 },
+      { key: 'palmRound',   label: 'Palm size',         min: 0.05, max: 0.40, step: 0.005 },
+      { key: 'edgeSoft',    label: 'Edge softness',     min: 0.2,  max: 4,    step: 0.05  },
+      { key: 'fill',        label: 'Fill opacity',     min: 0,    max: 1.2,  step: 0.01  },
+      { key: 'rim',         label: 'Rim glow',         min: 0,    max: 3,    step: 0.02  },
+      { key: 'halo',        label: 'Outer halo',       min: 0,    max: 0.6,  step: 0.01  },
+      { key: 'hue',         label: 'Hue',              min: 0,    max: 1,    step: 0.005 },
+      { key: 'sat',         label: 'Saturation',       min: 0,    max: 1,    step: 0.01  },
+      { key: 'light',       label: 'Lightness',        min: 0,    max: 1,    step: 0.01  }
     ];
-    function buildControls() {
-      const panel = document.getElementById('panel');
+
+    // generic slider panel bound to a params object (auto-saves on change)
+    function buildPanel(panel, title, controls, obj, defaults, save) {
       const fmt = (v, step) => (+v).toFixed(step < 0.01 ? 3 : 2);
       const sliders = {};
 
       const head = document.createElement('h3');
-      head.innerHTML = '<span>✦ controls</span><span id="panel-tog">[hide]</span>';
+      head.innerHTML = `<span>${title}</span><span class="panel-tog">[hide]</span>`;
+      const tog = head.querySelector('.panel-tog');
       head.addEventListener('click', () => {
         panel.classList.toggle('collapsed');
-        document.getElementById('panel-tog').textContent =
-          panel.classList.contains('collapsed') ? '[show]' : '[hide]';
+        tog.textContent = panel.classList.contains('collapsed') ? '[show]' : '[hide]';
       });
       panel.appendChild(head);
 
-      for (const c of CONTROLS) {
+      for (const c of controls) {
         const row = document.createElement('div'); row.className = 'row';
         const lab = document.createElement('label');
-        const val = document.createElement('span'); val.textContent = fmt(params[c.key], c.step);
+        const val = document.createElement('span'); val.textContent = fmt(obj[c.key], c.step);
         lab.appendChild(document.createTextNode(c.label)); lab.appendChild(val);
         const inp = document.createElement('input');
-        inp.type = 'range'; inp.min = c.min; inp.max = c.max; inp.step = c.step; inp.value = params[c.key];
+        inp.type = 'range'; inp.min = c.min; inp.max = c.max; inp.step = c.step; inp.value = obj[c.key];
         inp.addEventListener('input', () => {
-          params[c.key] = parseFloat(inp.value);
-          val.textContent = fmt(params[c.key], c.step);
-          saveParams();
+          obj[c.key] = parseFloat(inp.value);
+          val.textContent = fmt(obj[c.key], c.step);
+          save();
         });
         sliders[c.key] = { inp, val, step: c.step };
         row.appendChild(lab); row.appendChild(inp);
@@ -864,21 +925,21 @@
       const foot = document.createElement('div'); foot.id = 'panel-foot';
       const reset = document.createElement('button'); reset.textContent = 'reset';
       reset.addEventListener('click', () => {
-        Object.assign(params, DEFAULTS); saveParams();
-        for (const c of CONTROLS) {
-          sliders[c.key].inp.value = params[c.key];
-          sliders[c.key].val.textContent = fmt(params[c.key], c.step);
+        Object.assign(obj, defaults); save();
+        for (const c of controls) {
+          sliders[c.key].inp.value = obj[c.key];
+          sliders[c.key].val.textContent = fmt(obj[c.key], c.step);
         }
       });
       const copy = document.createElement('button'); copy.textContent = 'copy values';
       copy.addEventListener('click', () => {
-        navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(params, null, 2));
+        navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(obj, null, 2));
         copy.textContent = 'copied!'; setTimeout(() => { copy.textContent = 'copy values'; }, 1200);
       });
       foot.appendChild(reset); foot.appendChild(copy);
       panel.appendChild(foot);
     }
-    buildControls();
+    buildPanel(document.getElementById('panel'), '✦ hand', HAND_CONTROLS, handParams, HAND_DEFAULTS, saveHandParams);
 
     animate();
   </script>
