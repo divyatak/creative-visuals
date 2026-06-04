@@ -20,11 +20,35 @@
       color: rgba(255,255,255,0.12);
       pointer-events: none; z-index: 10;
     }
+    #panel {
+      position: fixed; top: 16px; right: 16px; z-index: 20;
+      width: 232px; max-height: 92vh; overflow-y: auto;
+      background: rgba(8,16,20,0.72); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+      border: 1px solid rgba(120,200,220,0.18); border-radius: 10px;
+      padding: 10px 12px; font: 11px monospace; color: rgba(200,235,245,0.85);
+      cursor: auto; user-select: none;
+    }
+    #panel.collapsed .row, #panel.collapsed #panel-foot { display: none; }
+    #panel h3 {
+      font-size: 11px; letter-spacing: 1px; font-weight: normal; margin: 0 0 6px;
+      color: rgba(160,220,235,0.7); display: flex; justify-content: space-between; cursor: pointer;
+    }
+    #panel .row { margin: 7px 0; }
+    #panel .row label { display: flex; justify-content: space-between; margin-bottom: 2px; color: rgba(190,225,235,0.65); }
+    #panel .row label span { color: rgba(150,235,210,0.95); }
+    #panel input[type=range] { width: 100%; height: 14px; accent-color: #5fd8c8; cursor: pointer; }
+    #panel-foot { margin-top: 10px; display: flex; gap: 8px; }
+    #panel-foot button {
+      flex: 1; background: rgba(95,216,200,0.12); color: rgba(180,235,225,0.9);
+      border: 1px solid rgba(120,200,220,0.25); border-radius: 6px; padding: 5px; font: 10px monospace; cursor: pointer;
+    }
+    #panel-foot button:hover { background: rgba(95,216,200,0.22); }
   </style>
 </head>
 <body>
   <a id="back" href="../">&larr; back</a>
   <div id="phase-label"></div>
+  <div id="panel"></div>
   <div id="hint" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font:20px monospace;color:rgba(255,255,255,0.35);letter-spacing:3px;pointer-events:none;z-index:10;transition:opacity 1.5s;">allow camera to see magic</div>
   <video id="video" playsinline style="display:none;"></video>
 
@@ -61,8 +85,26 @@
     const PIXEL_RATIO = IS_MOBILE ? Math.min(window.devicePixelRatio, 1.5)
                                   : Math.min(window.devicePixelRatio, 2);
 
-    const FLOW_STR = 0.20;       // gentle ocean drift strength (lower = calmer)
     const FLOW_SCALE = 0.0015;   // flow field spatial scale
+
+    // ── Live-tunable parameters (persisted to localStorage; see control panel) ──
+    const DEFAULTS = {
+      baseGlow:   0.14,   // resting particle brightness
+      excGlow:    0.50,   // extra brightness when disturbed
+      alpha:      1.46,   // overall particle opacity / glow
+      flowStr:    0.14,   // base-particle drift strength (how much they move)
+      flowSpeed:  1.50,   // how fast the currents evolve (base-particle speed)
+      damping:    0.942,  // velocity retention (higher = floatier, more movement)
+      jitter:     0.30,   // shimmer
+      trail:      0.94,   // trail persistence (higher = longer trails)
+      handSmooth: 0.23,   // hand jitter smoothing (lower = smoother, laggier)
+      repelRad:   0.12,   // repulsion radius (× hand span)
+      repelStr:   0.31    // repulsion push strength
+    };
+    const STORE_KEY = 'biolum-params-v1';
+    const params = Object.assign({}, DEFAULTS);
+    try { Object.assign(params, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {}
+    const saveParams = () => { try { localStorage.setItem(STORE_KEY, JSON.stringify(params)); } catch (e) {} };
 
     // ══════════════════════════════════════════════
     // RENDERER + CAMERA
@@ -185,7 +227,7 @@
                             ${sdf}(pos+vec2(0.0,eps)) - ${sdf}(pos-vec2(0.0,eps)));
               float glen = length(g); if (glen > 1e-4) g /= glen;
               float inf = clamp(1.0 - d0/R, 0.0, 1.6);
-              repel += g * inf * 0.40;
+              repel += g * inf * uRepelStr;
             } }`;
 
     // Shared hand state — written by detectHands, read by the sim each frame.
@@ -206,7 +248,6 @@
     ];
     const handActive = [false, false];   // detected in the latest sample
     const handPresent = [false, false];  // currently shown / being smoothed
-    const HAND_SMOOTH = 0.25;            // 0..1 per frame (lower = smoother, more lag)
 
     // ══════════════════════════════════════════════
     // GPU PARTICLE SIMULATION
@@ -242,7 +283,8 @@
 
     // ── Position/velocity step ──
     const posFrag = `
-      uniform float uTime, uDt, uW, uH, uFlowStr, uFlowScale, uRadBase;
+      uniform float uTime, uDt, uW, uH, uFlowStr, uFlowScale, uFlowSpeed, uRadBase;
+      uniform float uDamping, uJitter, uRepelRad, uRepelStr;
       uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
       uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
       uniform vec2 uMouse; uniform float uMouseOn;
@@ -272,7 +314,7 @@
         vec2 pos = P.xy; vec2 vel = P.zw;
 
         // gentle ocean drift (curl noise)
-        float t = uTime*0.4;
+        float t = uTime*uFlowSpeed;
         float fx = curlX(pos.x, pos.y, t, uFlowScale)*uFlowStr;
         float fy = curlY(pos.x, pos.y, t, uFlowScale)*uFlowStr;
 
@@ -281,20 +323,20 @@
 
         // disturbance: repel from the HAND EDGE (SDF gradient), + mouse fallback
         vec2 repel = vec2(0.0);
-        if (uHand0On > 0.5 && inBox(pos, uHand0Box)) { float scl = uHand0Scale; float R = max(scl*0.30, 30.0)*radNoise; ${genPush('handSDF0')} }
-        if (uHand1On > 0.5 && inBox(pos, uHand1Box)) { float scl = uHand1Scale; float R = max(scl*0.30, 30.0)*radNoise; ${genPush('handSDF1')} }
+        if (uHand0On > 0.5 && inBox(pos, uHand0Box)) { float scl = uHand0Scale; float R = max(scl*uRepelRad, 30.0)*radNoise; ${genPush('handSDF0')} }
+        if (uHand1On > 0.5 && inBox(pos, uHand1Box)) { float scl = uHand1Scale; float R = max(scl*uRepelRad, 30.0)*radNoise; ${genPush('handSDF1')} }
         if (uMouseOn > 0.5) {
           vec2 dd = pos - uMouse; float dist = length(dd); float rad = uRadBase*radNoise;
-          if (dist < rad && dist > 0.1) { float inf = 1.0 - dist/rad; repel += (dd/dist)*inf*0.25; }
+          if (dist < rad && dist > 0.1) { float inf = 1.0 - dist/rad; repel += (dd/dist)*inf*uRepelStr; }
         }
 
         // shimmer jitter (subtle — keep motion gentle)
         float jb = uTime*57.0 + hash12(uv)*123.0;
-        float jx = (hash11(jb+0.7)-0.5)*0.06;
-        float jy = (hash11(jb+9.1)-0.5)*0.06;
+        float jx = (hash11(jb+0.7)-0.5)*uJitter;
+        float jy = (hash11(jb+9.1)-0.5)*uJitter;
 
         vel += (vec2(fx,fy) + repel + vec2(jx,jy)) * uDt * 60.0;
-        vel *= 0.955; // more damping → smoother, gentler drift
+        vel *= uDamping;
         pos += vel;
 
         // wrap around edges
@@ -310,7 +352,7 @@
 
     // ── Age / excitation / hue step ──
     const dataFrag = `
-      uniform float uTime, uDt, uRadBase;
+      uniform float uTime, uDt, uRadBase, uRepelRad;
       uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
       uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
       uniform vec2 uMouse; uniform float uMouseOn;
@@ -346,8 +388,8 @@
         float seed = hash12(uv)*1000.0;
         float radNoise = 0.7 + 0.6*(sin(seed*3.7 + uTime*2.0)*0.5+0.5);
         float dIn = 0.0;
-        if (uHand0On>0.5 && inBox(pos,uHand0Box)){ float scl=uHand0Scale; float R=max(scl*0.30,30.0)*radNoise; float d0=handSDF0(pos); if(d0<R) dIn += clamp(1.0-abs(d0)/(R*0.7),0.0,1.0); }
-        if (uHand1On>0.5 && inBox(pos,uHand1Box)){ float scl=uHand1Scale; float R=max(scl*0.30,30.0)*radNoise; float d0=handSDF1(pos); if(d0<R) dIn += clamp(1.0-abs(d0)/(R*0.7),0.0,1.0); }
+        if (uHand0On>0.5 && inBox(pos,uHand0Box)){ float scl=uHand0Scale; float R=max(scl*uRepelRad,30.0)*radNoise; float d0=handSDF0(pos); if(d0<R) dIn += clamp(1.0-abs(d0)/(R*0.7),0.0,1.0); }
+        if (uHand1On>0.5 && inBox(pos,uHand1Box)){ float scl=uHand1Scale; float R=max(scl*uRepelRad,30.0)*radNoise; float d0=handSDF1(pos); if(d0<R) dIn += clamp(1.0-abs(d0)/(R*0.7),0.0,1.0); }
         if (uMouseOn>0.5){ vec2 dd=pos-uMouse; float dist=length(dd); float rad=uRadBase*radNoise; if(dist<rad&&dist>0.1) dIn += 1.0-dist/rad; }
 
         if (dIn > 0.0) exc = min(1.0, exc + dIn*0.10);
@@ -372,13 +414,15 @@
     Object.assign(posVar.material.uniforms, {
       uTime: { value: 0 }, uDt: { value: 0.016 },
       uW: { value: W }, uH: { value: H },
-      uFlowStr: { value: FLOW_STR }, uFlowScale: { value: FLOW_SCALE },
-      uRadBase: { value: 60 },
+      uFlowStr: { value: params.flowStr }, uFlowScale: { value: FLOW_SCALE },
+      uFlowSpeed: { value: params.flowSpeed }, uRadBase: { value: 60 },
+      uDamping: { value: params.damping }, uJitter: { value: params.jitter },
+      uRepelRad: { value: params.repelRad }, uRepelStr: { value: params.repelStr },
       ...handUniforms()
     });
     Object.assign(dataVar.material.uniforms, {
       uTime: { value: 0 }, uDt: { value: 0.016 },
-      uRadBase: { value: 60 },
+      uRadBase: { value: 60 }, uRepelRad: { value: params.repelRad },
       ...handUniforms()
     });
 
@@ -401,12 +445,15 @@
       uniforms: {
         texPos: { value: null },
         texData: { value: null },
-        uTime: { value: 0 }
+        uTime: { value: 0 },
+        uBaseGlow: { value: params.baseGlow },
+        uExcGlow: { value: params.excGlow },
+        uAlpha: { value: params.alpha }
       },
       vertexShader: `
         uniform sampler2D texPos;
         uniform sampler2D texData;
-        uniform float uTime;
+        uniform float uTime, uBaseGlow, uExcGlow, uAlpha;
         attribute vec2 reference;
         varying float vAlpha;
         varying float vHue;
@@ -421,9 +468,9 @@
           float ageFade = fadeIn*fadeOut;
           // breathing ambient: each particle gently pulses at its own rate
           float seed = hash12(reference)*1000.0;
-          float breath = 0.14 + 0.05*sin(uTime*(0.3 + seed*0.0004) + seed); // brighter base
-          float life = ageFade * (breath + exc*0.7);                        // smaller base↔excited gap
-          vAlpha = life * 1.55;
+          float breath = uBaseGlow + 0.05*sin(uTime*(0.3 + seed*0.0004) + seed);
+          float life = ageFade * (breath + exc*uExcGlow);
+          vAlpha = life * uAlpha;
           vHue = hue;
           gl_PointSize = 3.4 + life * 2.6; // brighter = bigger glow
           gl_Position = projectionMatrix * modelViewMatrix * vec4(P.xy, 0.0, 1.);
@@ -597,7 +644,7 @@
             for (let j = 0; j < 21; j++) pts[j].copy(t[j]);
             handPresent[h] = true;
           } else {
-            for (let j = 0; j < 21; j++) pts[j].lerp(t[j], HAND_SMOOTH);
+            for (let j = 0; j < 21; j++) pts[j].lerp(t[j], params.handSmooth);
           }
           updateHandGeom(h);
         } else if (handPresent[h]) {
@@ -659,6 +706,18 @@
       }
     }
 
+    // Push live-tunable params into the GPU uniforms (cheap; called each frame).
+    function applyParams() {
+      const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
+      pu.uFlowStr.value = params.flowStr;   pu.uFlowSpeed.value = params.flowSpeed;
+      pu.uDamping.value = params.damping;   pu.uJitter.value = params.jitter;
+      pu.uRepelRad.value = params.repelRad; pu.uRepelStr.value = params.repelStr;
+      du.uRepelRad.value = params.repelRad;
+      pMat.uniforms.uBaseGlow.value = params.baseGlow;
+      pMat.uniforms.uExcGlow.value = params.excGlow;
+      pMat.uniforms.uAlpha.value = params.alpha;
+    }
+
     // Push hand/mouse interaction state into a sim material's uniforms.
     function setHandUniforms(U) {
       U.uHand0On.value = handInfo[0].on; U.uHand0Scale.value = handInfo[0].scale; U.uHand0Box.value.copy(handInfo[0].box);
@@ -692,13 +751,13 @@
       const disturb = 1 - Math.abs(phase - 1);
       const mouseRadBase = 60 + disturb * 40;
       // breathing: trail persistence oscillates → whole field gently pulses
-      // higher base persistence → base particles leave gentle trails too
-      fadeMat.uniforms.fade.value = 0.94 + 0.012 * Math.sin(time * 0.3);
+      fadeMat.uniforms.fade.value = params.trail + 0.012 * Math.sin(time * 0.3);
 
       // ── Feed sim params + hand/mouse interaction state to the GPU ──
       const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
       pu.uTime.value = time; pu.uDt.value = dt; pu.uRadBase.value = mouseRadBase;
       du.uTime.value = time; du.uDt.value = dt; du.uRadBase.value = mouseRadBase;
+      applyParams();
       setHandUniforms(pu);
       setHandUniforms(du);
 
@@ -754,6 +813,72 @@
       trailCam.top = h/2; trailCam.bottom = -h/2;
       trailCam.updateProjectionMatrix();
     });
+
+    // ══════════════════════════════════════════════
+    // CONTROL PANEL (live tuning, persisted to localStorage)
+    // ══════════════════════════════════════════════
+    const CONTROLS = [
+      { key: 'baseGlow',   label: 'Base glow',          min: 0,    max: 0.5,  step: 0.01  },
+      { key: 'excGlow',    label: 'Excited glow',       min: 0,    max: 1.5,  step: 0.01  },
+      { key: 'alpha',      label: 'Overall brightness', min: 0.5,  max: 3,    step: 0.01  },
+      { key: 'flowStr',    label: 'Base movement',      min: 0,    max: 0.6,  step: 0.01  },
+      { key: 'flowSpeed',  label: 'Base speed',         min: 0,    max: 1.5,  step: 0.01  },
+      { key: 'damping',    label: 'Floatiness',         min: 0.90, max: 0.99, step: 0.001 },
+      { key: 'jitter',     label: 'Shimmer',            min: 0,    max: 0.3,  step: 0.005 },
+      { key: 'trail',      label: 'Trail length',       min: 0.80, max: 0.99, step: 0.005 },
+      { key: 'handSmooth', label: 'Hand smoothing',     min: 0.05, max: 1,    step: 0.01  },
+      { key: 'repelRad',   label: 'Repulsion radius',   min: 0.05, max: 0.6,  step: 0.01  },
+      { key: 'repelStr',   label: 'Repulsion strength', min: 0,    max: 1.2,  step: 0.01  }
+    ];
+    function buildControls() {
+      const panel = document.getElementById('panel');
+      const fmt = (v, step) => (+v).toFixed(step < 0.01 ? 3 : 2);
+      const sliders = {};
+
+      const head = document.createElement('h3');
+      head.innerHTML = '<span>✦ controls</span><span id="panel-tog">[hide]</span>';
+      head.addEventListener('click', () => {
+        panel.classList.toggle('collapsed');
+        document.getElementById('panel-tog').textContent =
+          panel.classList.contains('collapsed') ? '[show]' : '[hide]';
+      });
+      panel.appendChild(head);
+
+      for (const c of CONTROLS) {
+        const row = document.createElement('div'); row.className = 'row';
+        const lab = document.createElement('label');
+        const val = document.createElement('span'); val.textContent = fmt(params[c.key], c.step);
+        lab.appendChild(document.createTextNode(c.label)); lab.appendChild(val);
+        const inp = document.createElement('input');
+        inp.type = 'range'; inp.min = c.min; inp.max = c.max; inp.step = c.step; inp.value = params[c.key];
+        inp.addEventListener('input', () => {
+          params[c.key] = parseFloat(inp.value);
+          val.textContent = fmt(params[c.key], c.step);
+          saveParams();
+        });
+        sliders[c.key] = { inp, val, step: c.step };
+        row.appendChild(lab); row.appendChild(inp);
+        panel.appendChild(row);
+      }
+
+      const foot = document.createElement('div'); foot.id = 'panel-foot';
+      const reset = document.createElement('button'); reset.textContent = 'reset';
+      reset.addEventListener('click', () => {
+        Object.assign(params, DEFAULTS); saveParams();
+        for (const c of CONTROLS) {
+          sliders[c.key].inp.value = params[c.key];
+          sliders[c.key].val.textContent = fmt(params[c.key], c.step);
+        }
+      });
+      const copy = document.createElement('button'); copy.textContent = 'copy values';
+      copy.addEventListener('click', () => {
+        navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(params, null, 2));
+        copy.textContent = 'copied!'; setTimeout(() => { copy.textContent = 'copy values'; }, 1200);
+      });
+      foot.appendChild(reset); foot.appendChild(copy);
+      panel.appendChild(foot);
+    }
+    buildControls();
 
     animate();
   </script>
