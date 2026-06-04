@@ -47,12 +47,27 @@
     const PHASE_DURATION = 20;
     const W = window.innerWidth, H = window.innerHeight;
 
+    // ── Device tier (cheap heuristic; Tier 3 refines this with an FPS probe) ──
+    const IS_MOBILE = window.matchMedia('(pointer: coarse)').matches || Math.min(W, H) < 600;
+    // Trail/feedback buffers are fillrate-heavy; shrink them on phones.
+    let RT_SCALE = IS_MOBILE ? 1.0 : Math.min(window.devicePixelRatio, 2);
+    const PIXEL_RATIO = IS_MOBILE ? Math.min(window.devicePixelRatio, 1.5)
+                                  : Math.min(window.devicePixelRatio, 2);
+
+    // ── Flow-field grid: sample a low-res precomputed field instead of
+    //    running ~40 trig ops per particle per frame. Field is very
+    //    low-frequency in screen space, so a coarse grid + bilinear is exact-enough.
+    const GW = IS_MOBILE ? 48 : 80;   // grid columns
+    const GH = IS_MOBILE ? 27 : 45;   // grid rows
+    const fieldX = new Float32Array(GW * GH);
+    const fieldY = new Float32Array(GW * GH);
+
     // ══════════════════════════════════════════════
     // RENDERER + CAMERA
     // ══════════════════════════════════════════════
     const renderer = new THREE.WebGLRenderer({ antialias: false });
     renderer.setSize(W, H);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(PIXEL_RATIO);
     document.body.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
@@ -61,8 +76,8 @@
 
     // ── Trail framebuffers (feedback for persistence) ──
     const mkRT = () => new THREE.WebGLRenderTarget(
-      W * Math.min(window.devicePixelRatio, 2),
-      H * Math.min(window.devicePixelRatio, 2),
+      Math.round(W * RT_SCALE),
+      Math.round(H * RT_SCALE),
       { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat }
     );
     let rtA = mkRT(), rtB = mkRT();
@@ -206,6 +221,45 @@
     }
     function curlX(x,y,t,s){ const e=1.5; return (flowAngle(x,y+e,t,s)-flowAngle(x,y-e,t,s))/(e*2); }
     function curlY(x,y,t,s){ const e=1.5; return -(flowAngle(x+e,y,t,s)-flowAngle(x-e,y,t,s))/(e*2); }
+
+    // Rebuild the low-res flow field once per frame (GW*GH curl evals instead
+    // of one per particle). Node (gx,gy) maps to centered world coords.
+    function buildFlowField(t, s) {
+      for (let gy = 0; gy < GH; gy++) {
+        const wy = (gy / (GH - 1)) * H - H/2;
+        for (let gx = 0; gx < GW; gx++) {
+          const wx = (gx / (GW - 1)) * W - W/2;
+          const idx = gy * GW + gx;
+          fieldX[idx] = curlX(wx, wy, t, s);
+          fieldY[idx] = curlY(wx, wy, t, s);
+        }
+      }
+    }
+    // Bilinear sample of the field at centered world coords. Writes into flowOut.
+    const flowOut = [0, 0];
+    function sampleFlow(px, py) {
+      let gx = (px + W/2) / W * (GW - 1);
+      let gy = (py + H/2) / H * (GH - 1);
+      if (gx < 0) gx = 0; else if (gx > GW - 1.001) gx = GW - 1.001;
+      if (gy < 0) gy = 0; else if (gy > GH - 1.001) gy = GH - 1.001;
+      const x0 = gx | 0, y0 = gy | 0;
+      const tx = gx - x0, ty = gy - y0;
+      const i00 = y0 * GW + x0, i10 = i00 + 1, i01 = i00 + GW, i11 = i01 + 1;
+      const w00 = (1-tx)*(1-ty), w10 = tx*(1-ty), w01 = (1-tx)*ty, w11 = tx*ty;
+      flowOut[0] = fieldX[i00]*w00 + fieldX[i10]*w10 + fieldX[i01]*w01 + fieldX[i11]*w11;
+      flowOut[1] = fieldY[i00]*w00 + fieldY[i10]*w10 + fieldY[i01]*w01 + fieldY[i11]*w11;
+    }
+
+    // Precomputed jitter table — avoids 50k Math.random() calls/frame in the hot loop.
+    const JITTER_N = 2048;
+    const jitter = new Float32Array(JITTER_N);
+    for (let i = 0; i < JITTER_N; i++) jitter[i] = (Math.random() - 0.5) * 0.15;
+    let jitterPtr = 0;
+
+    // Spatial buckets for interactor points so each particle only tests nearby
+    // hand/mouse points instead of all ~120 of them. Reused across frames.
+    const INTERACT_CELL = 140; // must be >= max disturbance radius
+    const interactorBuckets = new Map();
 
     // ══════════════════════════════════════════════
     // INTERACTION POINTS (hands + mouse fallback)
@@ -428,10 +482,27 @@
       // breathing: trail persistence oscillates → whole field gently pulses
       fadeMat.uniforms.fade.value = 0.91 + 0.015 * Math.sin(time * 0.3);
 
+      // ── Rebuild low-res flow field once (instead of per particle) ──
+      buildFlowField(time * 0.4, flowScale);
+
+      // ── Bucket the active interactor points for fast neighbour lookup ──
+      const points = hasHands ? interactors : (mouseIn ? [{x: mouseX, y: mouseY}] : []);
+      interactorBuckets.clear();
+      for (let p = 0; p < points.length; p++) {
+        const cx = Math.floor((points[p].x + W/2) / INTERACT_CELL) + 1000;
+        const cy = Math.floor((points[p].y + H/2) / INTERACT_CELL) + 1000;
+        const key = cx * 100000 + cy;
+        let arr = interactorBuckets.get(key);
+        if (!arr) { arr = []; interactorBuckets.set(key, arr); }
+        arr.push(p);
+      }
+      const hasPoints = points.length > 0;
+
       const posArr = geo.attributes.position.array;
       const lifeArr = geo.attributes.aLife.array;
-      const hueArr = geo.attributes.aHueOff.array;
       let mouseActiveSum = 0;
+      let anyRespawn = false;
+      const hw = W/2+50, hh = H/2+50;
 
       for (let i = 0; i < PARTICLE_COUNT; i++) {
         const ix = i*3, iy = i*3+1, ivx = i*2, ivy = i*2+1;
@@ -440,8 +511,8 @@
         ages[i] += dt;
         const ageNorm = ages[i] / maxAges[i]; // 0→1
         if (ageNorm >= 1) {
-          respawn(i);
-          hueArr[i] = hueOffsets[i]; // sync buffer
+          respawn(i);           // writes hueOffsets[i] (= aHueOff buffer) directly
+          anyRespawn = true;
           continue;
         }
         // fade in first 10%, fade out last 20%
@@ -454,35 +525,46 @@
 
         let px = posArr[ix], py = posArr[iy];
 
-        // ── Gentle ocean drift ──
-        const fx = curlX(px, py, time * 0.4, flowScale) * flowStr;
-        const fy = curlY(px, py, time * 0.4, flowScale) * flowStr;
+        // ── Gentle ocean drift (bilinear sample of precomputed field) ──
+        sampleFlow(px, py);
+        const fx = flowOut[0] * flowStr;
+        const fy = flowOut[1] * flowStr;
 
-        // ── Disturbance: repel + excite ──
+        // ── Disturbance: repel + excite (only nearby interactor cells) ──
         let mx = 0, my = 0;
-        const points = hasHands ? interactors : (mouseIn ? [{x: mouseX, y: mouseY}] : []);
         const radNoise = 0.7 + 0.6 * (Math.sin(seeds[i] * 3.7 + time * 2) * 0.5 + 0.5);
         const rad = mouseRadBase * radNoise;
+        const rad2 = rad * rad;
         let disturbed = false;
-        for (let p = 0; p < points.length; p++) {
-          const dx = px - points[p].x, dy = py - points[p].y;
-          const dist = Math.sqrt(dx*dx + dy*dy);
-          if (dist < rad && dist > 0.1) {
-            const inf = 1 - dist/rad;
-            const infSq = inf * inf;
-            mouseActiveSum += inf;
-            mx += dx/dist * inf * 0.25;
-            my += dy/dist * inf * 0.25;
-            // excite this particle — it was disturbed
-            excitation[i] = Math.min(1, excitation[i] + inf * 0.06);
-            disturbed = true;
+        if (hasPoints) {
+          const pcx = Math.floor((px + W/2) / INTERACT_CELL) + 1000;
+          const pcy = Math.floor((py + H/2) / INTERACT_CELL) + 1000;
+          for (let ddx = -1; ddx <= 1; ddx++) {
+            for (let ddy = -1; ddy <= 1; ddy++) {
+              const arr = interactorBuckets.get((pcx+ddx) * 100000 + (pcy+ddy));
+              if (!arr) continue;
+              for (let k = 0; k < arr.length; k++) {
+                const pt = points[arr[k]];
+                const dx = px - pt.x, dy = py - pt.y;
+                const d2 = dx*dx + dy*dy;
+                if (d2 < rad2 && d2 > 0.01) {
+                  const dist = Math.sqrt(d2);
+                  const inf = 1 - dist/rad;
+                  mouseActiveSum += inf;
+                  mx += dx/dist * inf * 0.25;
+                  my += dy/dist * inf * 0.25;
+                  excitation[i] = Math.min(1, excitation[i] + inf * 0.06);
+                  disturbed = true;
+                }
+              }
+            }
           }
         }
         // excitation decays slowly
         if (!disturbed) excitation[i] *= 0.95; // fast glow decay
 
-        const jx = (Math.random() - 0.5) * 0.15;
-        const jy = (Math.random() - 0.5) * 0.15;
+        const jx = jitter[jitterPtr]; jitterPtr = (jitterPtr + 1) & (JITTER_N - 1);
+        const jy = jitter[jitterPtr]; jitterPtr = (jitterPtr + 1) & (JITTER_N - 1);
         velocities[ivx] += (fx + mx + jx) * dt * 60;
         velocities[ivy] += (fy + my + jy) * dt * 60;
         velocities[ivx] *= 0.98; // less damping — drift further
@@ -492,7 +574,6 @@
         posArr[iy] += velocities[ivy];
 
         // wrap
-        const hw = W/2+50, hh = H/2+50;
         if (posArr[ix] < -hw) posArr[ix] += W+100;
         if (posArr[ix] >  hw) posArr[ix] -= W+100;
         if (posArr[iy] < -hh) posArr[iy] += H+100;
@@ -501,7 +582,7 @@
 
       geo.attributes.position.needsUpdate = true;
       geo.attributes.aLife.needsUpdate = true;
-      geo.attributes.aHueOff.needsUpdate = true;
+      if (anyRespawn) geo.attributes.aHueOff.needsUpdate = true; // hue only changes on respawn
 
       const mouseActive = Math.min(1, mouseActiveSum / 200);
       smoothMouseActive += ((mouseIn ? Math.max(mouseActive, 0.3) : 0) - smoothMouseActive) * 0.05;
