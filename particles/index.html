@@ -61,7 +61,7 @@
     const PIXEL_RATIO = IS_MOBILE ? Math.min(window.devicePixelRatio, 1.5)
                                   : Math.min(window.devicePixelRatio, 2);
 
-    const FLOW_STR = 0.35;       // gentle ocean drift strength
+    const FLOW_STR = 0.20;       // gentle ocean drift strength (lower = calmer)
     const FLOW_SCALE = 0.0015;   // flow field spatial scale
 
     // ══════════════════════════════════════════════
@@ -198,6 +198,16 @@
       { on: 0, scale: 100, box: new THREE.Vector4() }
     ];
 
+    // Hand smoothing — lerp toward the latest detection each frame to kill
+    // MediaPipe's per-sample jitter and interpolate between detections.
+    const handTarget = [
+      Array.from({ length: 21 }, () => new THREE.Vector2()),
+      Array.from({ length: 21 }, () => new THREE.Vector2())
+    ];
+    const handActive = [false, false];   // detected in the latest sample
+    const handPresent = [false, false];  // currently shown / being smoothed
+    const HAND_SMOOTH = 0.25;            // 0..1 per frame (lower = smoother, more lag)
+
     // ══════════════════════════════════════════════
     // GPU PARTICLE SIMULATION
     // ══════════════════════════════════════════════
@@ -278,13 +288,13 @@
           if (dist < rad && dist > 0.1) { float inf = 1.0 - dist/rad; repel += (dd/dist)*inf*0.25; }
         }
 
-        // shimmer jitter
+        // shimmer jitter (subtle — keep motion gentle)
         float jb = uTime*57.0 + hash12(uv)*123.0;
-        float jx = (hash11(jb+0.7)-0.5)*0.15;
-        float jy = (hash11(jb+9.1)-0.5)*0.15;
+        float jx = (hash11(jb+0.7)-0.5)*0.06;
+        float jy = (hash11(jb+9.1)-0.5)*0.06;
 
         vel += (vec2(fx,fy) + repel + vec2(jx,jy)) * uDt * 60.0;
-        vel *= 0.98; // less damping — drift further
+        vel *= 0.955; // more damping → smoother, gentler drift
         pos += vel;
 
         // wrap around edges
@@ -411,11 +421,11 @@
           float ageFade = fadeIn*fadeOut;
           // breathing ambient: each particle gently pulses at its own rate
           float seed = hash12(reference)*1000.0;
-          float breath = 0.08 + 0.03*sin(uTime*(0.3 + seed*0.0004) + seed);
-          float life = ageFade * (breath + exc*0.8);
-          vAlpha = life * 1.3;
+          float breath = 0.14 + 0.05*sin(uTime*(0.3 + seed*0.0004) + seed); // brighter base
+          float life = ageFade * (breath + exc*0.7);                        // smaller base↔excited gap
+          vAlpha = life * 1.55;
           vHue = hue;
-          gl_PointSize = 3.0 + life * 2.5; // brighter = bigger glow
+          gl_PointSize = 3.4 + life * 2.6; // brighter = bigger glow
           gl_Position = projectionMatrix * modelViewMatrix * vec4(P.xy, 0.0, 1.);
         }
       `,
@@ -532,16 +542,24 @@
       handMeshes.push(m);
     }
 
-    function updateHandMesh(handIdx, hand) {
+    // store the latest raw detection as the smoothing target
+    function setHandTarget(handIdx, hand) {
+      const t = handTarget[handIdx];
+      for (let j = 0; j < 21; j++) {
+        t[j].set((1 - hand[j].x) * W - W/2, -(hand[j].y * H - H/2));
+      }
+      handActive[handIdx] = true;
+    }
+
+    // rebuild geometry + sim box from the SMOOTHED points (called every frame)
+    function updateHandGeom(handIdx) {
       const mesh = handMeshes[handIdx];
       const u = mesh.material.uniforms;
-      const pts = handPts[handIdx];        // shared between render + sim
+      const pts = handPts[handIdx];
       let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
       let wristX = 0, wristY = 0, midX = 0, midY = 0;
       for (let j = 0; j < 21; j++) {
-        const x = (1 - hand[j].x) * W - W/2;
-        const y = -(hand[j].y * H - H/2);
-        pts[j].set(x, y);
+        const x = pts[j].x, y = pts[j].y;
         if (j === 0) { wristX = x; wristY = y; }
         if (j === 9) { midX = x; midY = y; }
         if (x < minX) minX = x; if (x > maxX) maxX = x;
@@ -555,9 +573,8 @@
 
       const margin = 0.5 * span; // room for palm rounding + tip radius + halo
       const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-      const sx = (maxX - minX) + margin*2, sy = (maxY - minY) + margin*2;
       mesh.position.set(cx, cy, 0);
-      mesh.scale.set(sx, sy, 1);
+      mesh.scale.set((maxX - minX) + margin*2, (maxY - minY) + margin*2, 1);
       mesh.visible = true;
 
       // share state with the particle sim (edge-interaction)
@@ -569,6 +586,25 @@
     function hideHandMesh(handIdx) {
       handMeshes[handIdx].visible = false;
       handInfo[handIdx].on = 0;
+    }
+
+    // per-frame smoothing: ease the rendered/sim points toward the latest sample
+    function updateHands() {
+      for (let h = 0; h < 2; h++) {
+        if (handActive[h]) {
+          const pts = handPts[h], t = handTarget[h];
+          if (!handPresent[h]) {                       // just appeared → snap, don't glide in
+            for (let j = 0; j < 21; j++) pts[j].copy(t[j]);
+            handPresent[h] = true;
+          } else {
+            for (let j = 0; j < 21; j++) pts[j].lerp(t[j], HAND_SMOOTH);
+          }
+          updateHandGeom(h);
+        } else if (handPresent[h]) {
+          handPresent[h] = false;
+          hideHandMesh(h);
+        }
+      }
     }
 
     function lm2scene(lm) {
@@ -616,16 +652,11 @@
 
       const nHands = (results.landmarks && results.landmarks.length) || 0;
 
-      if (nHands > 0) {
-        hasHands = true;
-        for (let h = 0; h < nHands && h < 2; h++) {
-          updateHandMesh(h, results.landmarks[h]); // updates render + sim state
-        }
-      } else {
-        hasHands = false;
+      hasHands = nHands > 0;
+      handActive[0] = false; handActive[1] = false;
+      for (let h = 0; h < nHands && h < 2; h++) {
+        setHandTarget(h, results.landmarks[h]); // store smoothing target only
       }
-      // hide any hand slots not detected this frame
-      for (let h = nHands; h < 2; h++) hideHandMesh(h);
     }
 
     // Push hand/mouse interaction state into a sim material's uniforms.
@@ -653,6 +684,7 @@
       time += dt;
 
       detectHands();
+      updateHands();   // smooth hand toward latest detection (kills MediaPipe jitter)
 
       const phase = Math.min((time % totalCycle) / PHASE_DURATION, 2.999);
       phaseEl.textContent = NAMES[Math.floor(phase)];
@@ -660,7 +692,8 @@
       const disturb = 1 - Math.abs(phase - 1);
       const mouseRadBase = 60 + disturb * 40;
       // breathing: trail persistence oscillates → whole field gently pulses
-      fadeMat.uniforms.fade.value = 0.91 + 0.015 * Math.sin(time * 0.3);
+      // higher base persistence → base particles leave gentle trails too
+      fadeMat.uniforms.fade.value = 0.94 + 0.012 * Math.sin(time * 0.3);
 
       // ── Feed sim params + hand/mouse interaction state to the GPU ──
       const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
