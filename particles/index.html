@@ -138,6 +138,67 @@
     `;
 
     // ══════════════════════════════════════════════
+    // HAND SILHOUETTE SDF (shared: hand render + particle edge-interaction)
+    // ══════════════════════════════════════════════
+    const FINGERS = [
+      { idx: [1, 2, 3, 4],     base: 0.17  }, // thumb (fatter)
+      { idx: [5, 6, 7, 8],     base: 0.14  }, // index
+      { idx: [9, 10, 11, 12],  base: 0.145 }, // middle
+      { idx: [13, 14, 15, 16], base: 0.135 }, // ring
+      { idx: [17, 18, 19, 20], base: 0.115 }  // pinky
+    ];
+    const TAPER = [1.0, 0.9, 0.8, 0.7];   // radius multiplier base→tip
+    const PALM = [0, 1, 5, 9, 13, 17];    // boundary: wrist→thumb base→knuckles→pinky
+    const PALM_ROUND = 0.17;              // palm inflation (fraction of hand span)
+
+    // Emit the SDF body (declares float d) for point-array P and scale S,
+    // using literal indices only (GLSL ES 1.00 safe). The point var is `p`.
+    function genSDFBody(P, S) {
+      let g = 'float d = 1e5;\n';
+      for (const f of FINGERS) {
+        for (let s = 0; s < 3; s++) {
+          const a = f.idx[s], b = f.idx[s+1];
+          const ra = (f.base * TAPER[s]).toFixed(4), rb = (f.base * TAPER[s+1]).toFixed(4);
+          g += `d = min(d, sdRoundCone(p, ${P}[${a}], ${P}[${b}], ${ra}*${S}, ${rb}*${S}));\n`;
+        }
+      }
+      g += `float dp = dot(p-${P}[${PALM[0]}], p-${P}[${PALM[0]}]); float sp = 1.0;\n`;
+      for (let i = 0, j = PALM.length - 1; i < PALM.length; j = i, i++) {
+        const vi = PALM[i], vj = PALM[j];
+        g += `{ vec2 e=${P}[${vj}]-${P}[${vi}]; vec2 w=p-${P}[${vi}];`
+          +  ` vec2 b=w-e*clamp(dot(w,e)/dot(e,e),0.0,1.0); dp=min(dp,dot(b,b));`
+          +  ` bvec3 c=bvec3(p.y>=${P}[${vi}].y, p.y<${P}[${vj}].y, e.x*w.y>e.y*w.x);`
+          +  ` if(all(c)||all(not(c))) sp=-sp; }\n`;
+      }
+      g += `d = min(d, sp*sqrt(dp) - ${PALM_ROUND.toFixed(4)}*${S});\n`;
+      return g;
+    }
+    const SD_ROUNDCONE = `float sdRoundCone(vec2 p, vec2 a, vec2 b, float ra, float rb){ vec2 ba=b-a; float l2=max(dot(ba,ba),1e-4); float t=clamp(dot(p-a,ba)/l2,0.0,1.0); return length(p-(a+t*ba))-mix(ra,rb,t); }`;
+    const INBOX = `bool inBox(vec2 p, vec4 b){ return p.x>=b.x && p.y>=b.y && p.x<=b.z && p.y<=b.w; }`;
+    const genSDF = (fn, P, S) => `float ${fn}(vec2 p){ ${genSDFBody(P, S)} return d; }`;
+    // edge-repulsion block: push a particle along the SDF gradient, strongest inside
+    const genPush = (sdf) => `
+          { float d0 = ${sdf}(pos);
+            if (d0 < R) {
+              float eps = max(scl*0.02, 1.5);
+              vec2 g = vec2(${sdf}(pos+vec2(eps,0.0)) - ${sdf}(pos-vec2(eps,0.0)),
+                            ${sdf}(pos+vec2(0.0,eps)) - ${sdf}(pos-vec2(0.0,eps)));
+              float glen = length(g); if (glen > 1e-4) g /= glen;
+              float inf = clamp(1.0 - d0/R, 0.0, 1.6);
+              repel += g * inf * 0.40;
+            } }`;
+
+    // Shared hand state — written by detectHands, read by the sim each frame.
+    const handPts = [
+      Array.from({ length: 21 }, () => new THREE.Vector2()),
+      Array.from({ length: 21 }, () => new THREE.Vector2())
+    ];
+    const handInfo = [
+      { on: 0, scale: 100, box: new THREE.Vector4() },
+      { on: 0, scale: 100, box: new THREE.Vector4() }
+    ];
+
+    // ══════════════════════════════════════════════
     // GPU PARTICLE SIMULATION
     // ══════════════════════════════════════════════
     // texPos : xy = position (centered scene coords), zw = velocity
@@ -169,20 +230,18 @@
       }
     })();
 
-    // ── Interactor positions (hands/mouse) passed to the GPU as a data texture ──
-    const interactorData = new Float32Array(MAX_POINTS * 4);
-    const interactorTex = new THREE.DataTexture(
-      interactorData, MAX_POINTS, 1, THREE.RGBAFormat, THREE.FloatType
-    );
-    interactorTex.needsUpdate = true;
-
     // ── Position/velocity step ──
     const posFrag = `
       uniform float uTime, uDt, uW, uH, uFlowStr, uFlowScale, uRadBase;
-      uniform sampler2D uInteractors;
-      uniform int uCount;
+      uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
+      uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
+      uniform vec2 uMouse; uniform float uMouseOn;
       ${GLSL_HASH}
       ${GLSL_FLOW}
+      ${SD_ROUNDCONE}
+      ${INBOX}
+      ${genSDF('handSDF0', 'uHand0Pts', 'uHand0Scale')}
+      ${genSDF('handSDF1', 'uHand1Pts', 'uHand1Scale')}
       void main(){
         vec2 uv = gl_FragCoord.xy / resolution.xy;
         vec4 P = texture2D(texPos, uv);
@@ -207,20 +266,16 @@
         float fx = curlX(pos.x, pos.y, t, uFlowScale)*uFlowStr;
         float fy = curlY(pos.x, pos.y, t, uFlowScale)*uFlowStr;
 
-        // disturbance: repel from each interactor point
         float seed = hash12(uv)*1000.0;
         float radNoise = 0.7 + 0.6*(sin(seed*3.7 + uTime*2.0)*0.5+0.5);
-        float rad = uRadBase*radNoise;
+
+        // disturbance: repel from the HAND EDGE (SDF gradient), + mouse fallback
         vec2 repel = vec2(0.0);
-        for (int p=0; p<${MAX_POINTS}; p++){
-          if (p >= uCount) break;
-          vec4 it = texture2D(uInteractors, vec2((float(p)+0.5)/${MAX_POINTS}.0, 0.5));
-          vec2 d = pos - it.xy;
-          float dist = length(d);
-          if (dist < rad && dist > 0.1){
-            float inf = 1.0 - dist/rad;
-            repel += (d/dist)*inf*0.25;
-          }
+        if (uHand0On > 0.5 && inBox(pos, uHand0Box)) { float scl = uHand0Scale; float R = max(scl*0.30, 30.0)*radNoise; ${genPush('handSDF0')} }
+        if (uHand1On > 0.5 && inBox(pos, uHand1Box)) { float scl = uHand1Scale; float R = max(scl*0.30, 30.0)*radNoise; ${genPush('handSDF1')} }
+        if (uMouseOn > 0.5) {
+          vec2 dd = pos - uMouse; float dist = length(dd); float rad = uRadBase*radNoise;
+          if (dist < rad && dist > 0.1) { float inf = 1.0 - dist/rad; repel += (dd/dist)*inf*0.25; }
         }
 
         // shimmer jitter
@@ -246,9 +301,14 @@
     // ── Age / excitation / hue step ──
     const dataFrag = `
       uniform float uTime, uDt, uRadBase;
-      uniform sampler2D uInteractors;
-      uniform int uCount;
+      uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
+      uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
+      uniform vec2 uMouse; uniform float uMouseOn;
       ${GLSL_HASH}
+      ${SD_ROUNDCONE}
+      ${INBOX}
+      ${genSDF('handSDF0', 'uHand0Pts', 'uHand0Scale')}
+      ${genSDF('handSDF1', 'uHand1Pts', 'uHand1Scale')}
       void main(){
         vec2 uv = gl_FragCoord.xy / resolution.xy;
         vec4 P = texture2D(texPos, uv);
@@ -271,24 +331,17 @@
           return;
         }
 
-        // excite when disturbed by an interactor, else decay
+        // excite strongest along the hand EDGE (|SDF| small), + mouse fallback
         vec2 pos = P.xy;
         float seed = hash12(uv)*1000.0;
         float radNoise = 0.7 + 0.6*(sin(seed*3.7 + uTime*2.0)*0.5+0.5);
-        float rad = uRadBase*radNoise;
-        bool disturbed = false;
-        for (int p=0; p<${MAX_POINTS}; p++){
-          if (p >= uCount) break;
-          vec4 it = texture2D(uInteractors, vec2((float(p)+0.5)/${MAX_POINTS}.0, 0.5));
-          vec2 d = pos - it.xy;
-          float dist = length(d);
-          if (dist < rad && dist > 0.1){
-            float inf = 1.0 - dist/rad;
-            exc = min(1.0, exc + inf*0.06);
-            disturbed = true;
-          }
-        }
-        if (!disturbed) exc *= 0.95;
+        float dIn = 0.0;
+        if (uHand0On>0.5 && inBox(pos,uHand0Box)){ float scl=uHand0Scale; float R=max(scl*0.30,30.0)*radNoise; float d0=handSDF0(pos); if(d0<R) dIn += clamp(1.0-abs(d0)/(R*0.7),0.0,1.0); }
+        if (uHand1On>0.5 && inBox(pos,uHand1Box)){ float scl=uHand1Scale; float R=max(scl*0.30,30.0)*radNoise; float d0=handSDF1(pos); if(d0<R) dIn += clamp(1.0-abs(d0)/(R*0.7),0.0,1.0); }
+        if (uMouseOn>0.5){ vec2 dd=pos-uMouse; float dist=length(dd); float rad=uRadBase*radNoise; if(dist<rad&&dist>0.1) dIn += 1.0-dist/rad; }
+
+        if (dIn > 0.0) exc = min(1.0, exc + dIn*0.10);
+        else exc *= 0.95;
 
         age += uDt;
         gl_FragColor = vec4(age, maxAge, exc, hue);
@@ -300,18 +353,23 @@
     gpu.setVariableDependencies(posVar, [posVar, dataVar]);
     gpu.setVariableDependencies(dataVar, [posVar, dataVar]);
 
-    // uniforms shared by both compute passes
+    // shared interaction uniforms (hand-edge SDF repulsion + mouse fallback)
+    const handUniforms = () => ({
+      uHand0Pts: { value: handPts[0] }, uHand0Scale: { value: 100 }, uHand0On: { value: 0 }, uHand0Box: { value: new THREE.Vector4() },
+      uHand1Pts: { value: handPts[1] }, uHand1Scale: { value: 100 }, uHand1On: { value: 0 }, uHand1Box: { value: new THREE.Vector4() },
+      uMouse: { value: new THREE.Vector2() }, uMouseOn: { value: 0 }
+    });
     Object.assign(posVar.material.uniforms, {
       uTime: { value: 0 }, uDt: { value: 0.016 },
       uW: { value: W }, uH: { value: H },
       uFlowStr: { value: FLOW_STR }, uFlowScale: { value: FLOW_SCALE },
       uRadBase: { value: 60 },
-      uInteractors: { value: interactorTex }, uCount: { value: 0 }
+      ...handUniforms()
     });
     Object.assign(dataVar.material.uniforms, {
       uTime: { value: 0 }, uDt: { value: 0.016 },
       uRadBase: { value: 60 },
-      uInteractors: { value: interactorTex }, uCount: { value: 0 }
+      ...handUniforms()
     });
 
     const gpuErr = gpu.init();
@@ -416,43 +474,7 @@
 
     const PALM_VERTS = [0, 1, 5, 9, 13, 17];
 
-    // ── Solid glowing hand (clean SDF silhouette, NOT metaballs) ──
-    // Fingers = tapered rounded capsule-chains (smooth, no lumps); palm = a
-    // filled, inflated polygon through wrist + knuckles. Hard union (min) keeps
-    // edges crisp. Result: a real hand outline, filled and glowing.
-    const FINGERS = [
-      { idx: [1, 2, 3, 4],     base: 0.17  }, // thumb (fatter)
-      { idx: [5, 6, 7, 8],     base: 0.14  }, // index
-      { idx: [9, 10, 11, 12],  base: 0.145 }, // middle
-      { idx: [13, 14, 15, 16], base: 0.135 }, // ring
-      { idx: [17, 18, 19, 20], base: 0.115 }  // pinky
-    ];
-    const TAPER = [1.0, 0.9, 0.8, 0.7];   // radius multiplier base→tip (smooth taper)
-    const PALM = [0, 1, 5, 9, 13, 17];    // boundary: wrist→thumb base→knuckles→pinky
-    const PALM_ROUND = 0.17;              // palm inflation (fraction of hand span)
-
-    // ---- generate GLSL with literal indices (GLSL ES 1.00 safe) ----
-    let fingerGLSL = '';
-    for (const f of FINGERS) {
-      for (let s = 0; s < 3; s++) {
-        const a = f.idx[s], b = f.idx[s+1];
-        const ra = (f.base * TAPER[s]).toFixed(4);
-        const rb = (f.base * TAPER[s+1]).toFixed(4);
-        fingerGLSL += `d = min(d, sdRoundCone(p, uPts[${a}], uPts[${b}], ${ra}*uScale, ${rb}*uScale));\n          `;
-      }
-    }
-    // palm: Inigo-Quilez polygon distance, unrolled over the PALM boundary
-    let palmGLSL = `float dp = dot(p-uPts[${PALM[0]}], p-uPts[${PALM[0]}]); float sp = 1.0;\n          `;
-    for (let i = 0, j = PALM.length - 1; i < PALM.length; j = i, i++) {
-      const vi = PALM[i], vj = PALM[j];
-      palmGLSL +=
-        `{ vec2 e=uPts[${vj}]-uPts[${vi}]; vec2 w=p-uPts[${vi}];` +
-        ` vec2 b=w-e*clamp(dot(w,e)/dot(e,e),0.0,1.0); dp=min(dp,dot(b,b));` +
-        ` bvec3 c=bvec3(p.y>=uPts[${vi}].y, p.y<uPts[${vj}].y, e.x*w.y>e.y*w.x);` +
-        ` if(all(c)||all(not(c))) sp=-sp; }\n          `;
-    }
-    palmGLSL += `d = min(d, sp*sqrt(dp) - ${PALM_ROUND.toFixed(4)}*uScale);`;
-
+    // ── Solid glowing hand: render the silhouette SDF as a filled glow ──
     const handFrag = `
       precision highp float;
       uniform vec2 uPts[21];
@@ -460,21 +482,11 @@
       uniform float uAA;      // edge softness (px)
       uniform vec3 uColor;
       varying vec2 vWorld;
-
-      // distance to a capsule with different end radii (rounded cone)
-      float sdRoundCone(vec2 p, vec2 a, vec2 b, float ra, float rb){
-        vec2 ba = b - a;
-        float l2 = max(dot(ba, ba), 1e-4);
-        float t = clamp(dot(p - a, ba)/l2, 0.0, 1.0);
-        return length(p - (a + t*ba)) - mix(ra, rb, t);
-      }
-
+      ${SD_ROUNDCONE}
+      ${genSDF('handSDF', 'uPts', 'uScale')}
       void main(){
         vec2 p = vWorld;
-        float d = 1e5;
-        ${fingerGLSL}
-        ${palmGLSL}
-
+        float d = handSDF(p);
         float inside = smoothstep(uAA, -uAA, d);             // crisp solid fill
         float rim    = smoothstep(0.05*uScale, 0.0, abs(d)); // bright edge band
         float outer  = exp(max(d, 0.0) / -(0.05*uScale));    // soft halo
@@ -493,11 +505,10 @@
       }
     `;
 
-    function makeHandMat() {
-      const pts = []; for (let i = 0; i < 21; i++) pts.push(new THREE.Vector2());
+    function makeHandMat(handIdx) {
       return new THREE.ShaderMaterial({
         uniforms: {
-          uPts:   { value: pts },
+          uPts:   { value: handPts[handIdx] }, // shared with the particle sim
           uScale: { value: 100 },
           uAA:    { value: 2 },
           uColor: { value: new THREE.Color(0.30, 0.78, 0.88) }
@@ -514,30 +525,30 @@
     const handScene = new THREE.Scene();
     const handMeshes = [];
     for (let h = 0; h < 2; h++) {
-      const m = new THREE.Mesh(handQuadGeo, makeHandMat());
+      const m = new THREE.Mesh(handQuadGeo, makeHandMat(h));
       m.frustumCulled = false;
       m.visible = false;
       handScene.add(m);
       handMeshes.push(m);
     }
 
-    const _p2 = []; for (let i = 0; i < 21; i++) _p2.push({ x: 0, y: 0 });
-
     function updateHandMesh(handIdx, hand) {
       const mesh = handMeshes[handIdx];
       const u = mesh.material.uniforms;
-      const pts = u.uPts.value;
+      const pts = handPts[handIdx];        // shared between render + sim
       let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+      let wristX = 0, wristY = 0, midX = 0, midY = 0;
       for (let j = 0; j < 21; j++) {
         const x = (1 - hand[j].x) * W - W/2;
         const y = -(hand[j].y * H - H/2);
-        _p2[j].x = x; _p2[j].y = y;
         pts[j].set(x, y);
+        if (j === 0) { wristX = x; wristY = y; }
+        if (j === 9) { midX = x; midY = y; }
         if (x < minX) minX = x; if (x > maxX) maxX = x;
         if (y < minY) minY = y; if (y > maxY) maxY = y;
       }
       // hand span = wrist (0) → middle knuckle (9)
-      const dx = _p2[9].x - _p2[0].x, dy = _p2[9].y - _p2[0].y;
+      const dx = midX - wristX, dy = midY - wristY;
       const span = Math.max(40, Math.sqrt(dx*dx + dy*dy));
       u.uScale.value = span;
       u.uAA.value = Math.max(1.5, 0.02 * span);
@@ -548,9 +559,17 @@
       mesh.position.set(cx, cy, 0);
       mesh.scale.set(sx, sy, 1);
       mesh.visible = true;
+
+      // share state with the particle sim (edge-interaction)
+      const info = handInfo[handIdx];
+      info.on = 1; info.scale = span;
+      info.box.set(minX - margin, minY - margin, maxX + margin, maxY + margin);
     }
 
-    function hideHandMesh(handIdx) { handMeshes[handIdx].visible = false; }
+    function hideHandMesh(handIdx) {
+      handMeshes[handIdx].visible = false;
+      handInfo[handIdx].on = 0;
+    }
 
     function lm2scene(lm) {
       return { x: (1 - lm.x) * W - W/2, y: -(lm.y * H - H/2) };
@@ -599,30 +618,8 @@
 
       if (nHands > 0) {
         hasHands = true;
-        interactors = [];
-
         for (let h = 0; h < nHands && h < 2; h++) {
-          const hand = results.landmarks[h];
-
-          // ── All 21 landmarks as repel points ──
-          for (let j = 0; j < 21; j++) {
-            interactors.push(lm2scene(hand[j]));
-          }
-          // ── Interpolated palm fill points ──
-          for (let a = 0; a < PALM_VERTS.length; a++) {
-            for (let b = a + 1; b < PALM_VERTS.length; b++) {
-              const la = hand[PALM_VERTS[a]], lb = hand[PALM_VERTS[b]];
-              interactors.push(lm2scene({ x: (la.x+lb.x)/2, y: (la.y+lb.y)/2 }));
-            }
-          }
-          // palm center
-          let cx = 0, cy = 0;
-          for (const v of PALM_VERTS) { cx += hand[v].x; cy += hand[v].y; }
-          cx /= PALM_VERTS.length; cy /= PALM_VERTS.length;
-          interactors.push(lm2scene({ x: cx, y: cy }));
-
-          // ── Update solid glowing hand ──
-          updateHandMesh(h, hand);
+          updateHandMesh(h, results.landmarks[h]); // updates render + sim state
         }
       } else {
         hasHands = false;
@@ -631,17 +628,12 @@
       for (let h = nHands; h < 2; h++) hideHandMesh(h);
     }
 
-    // Upload the active interactor points into the GPU data texture.
-    function updateInteractorTexture(points) {
-      const n = Math.min(points.length, MAX_POINTS);
-      for (let p = 0; p < n; p++) {
-        interactorData[p*4]   = points[p].x;
-        interactorData[p*4+1] = points[p].y;
-        interactorData[p*4+2] = 1;
-        interactorData[p*4+3] = 0;
-      }
-      interactorTex.needsUpdate = true;
-      return n;
+    // Push hand/mouse interaction state into a sim material's uniforms.
+    function setHandUniforms(U) {
+      U.uHand0On.value = handInfo[0].on; U.uHand0Scale.value = handInfo[0].scale; U.uHand0Box.value.copy(handInfo[0].box);
+      U.uHand1On.value = handInfo[1].on; U.uHand1Scale.value = handInfo[1].scale; U.uHand1Box.value.copy(handInfo[1].box);
+      U.uMouse.value.set(mouseX, mouseY);
+      U.uMouseOn.value = hasHands ? 0.0 : (mouseIn ? 1.0 : 0.0);
     }
 
     // ══════════════════════════════════════════════
@@ -670,13 +662,12 @@
       // breathing: trail persistence oscillates → whole field gently pulses
       fadeMat.uniforms.fade.value = 0.91 + 0.015 * Math.sin(time * 0.3);
 
-      // ── Feed interactor points + sim params to the GPU ──
-      const points = hasHands ? interactors : (mouseIn ? [{x: mouseX, y: mouseY}] : []);
-      const count = updateInteractorTexture(points);
-
+      // ── Feed sim params + hand/mouse interaction state to the GPU ──
       const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
-      pu.uTime.value = time; pu.uDt.value = dt; pu.uRadBase.value = mouseRadBase; pu.uCount.value = count;
-      du.uTime.value = time; du.uDt.value = dt; du.uRadBase.value = mouseRadBase; du.uCount.value = count;
+      pu.uTime.value = time; pu.uDt.value = dt; pu.uRadBase.value = mouseRadBase;
+      du.uTime.value = time; du.uDt.value = dt; du.uRadBase.value = mouseRadBase;
+      setHandUniforms(pu);
+      setHandUniforms(du);
 
       // ── Step the simulation on the GPU ──
       gpu.compute();
