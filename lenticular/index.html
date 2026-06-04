@@ -252,7 +252,8 @@
     // STATE
     // ══════════════════════════════════════════════
     let current = 0;
-    let loadedImages = []; // array of arrays
+    let loadedImages = [];   // sparse: loadedImages[i] = [img, img]
+    const loadingState = []; // loadingState[i] = Promise once that piece starts loading
     let angle = 0.5, targetAngle = 0.5;
     let rotY = 0, targetRotY = 0;
     let rotX = 0, targetRotX = 0;
@@ -272,28 +273,32 @@
     // ══════════════════════════════════════════════
     // LOAD IMAGES
     // ══════════════════════════════════════════════
+    // Load a single piece's images (idempotent — returns the in-flight promise).
+    function loadPiece(i) {
+      if (loadingState[i]) return loadingState[i];
+      const p = Promise.all(PIECES[i].images.map(src => new Promise(res => {
+        const img = new Image();
+        img.onload = () => res(img.naturalWidth > 0 ? img : null);
+        img.onerror = () => res(null);
+        img.src = src;
+      }))).then(imgs => { loadedImages[i] = imgs.filter(Boolean); return loadedImages[i]; });
+      loadingState[i] = p;
+      return p;
+    }
+    const ensureLoaded = i => loadPiece(((i % PIECES.length) + PIECES.length) % PIECES.length);
+
     async function loadAll() {
       const loadingEl = document.getElementById('loading');
-      const loadText = document.getElementById('load-text');
-      let loaded = 0;
-
-      for (const piece of PIECES) {
-        const imgs = [];
-        for (const src of piece.images) {
-          const img = new Image();
-          img.src = src;
-          await new Promise(r => { img.onload = r; img.onerror = r; });
-          if (img.naturalWidth > 0) imgs.push(img);
-        }
-        loadedImages.push(imgs);
-        loaded++;
-        loadText.textContent = `loading ${loaded} / ${PIECES.length}`;
-      }
-
+      await loadPiece(0);          // first piece ASAP → show immediately
       loadingEl.classList.add('done');
       buildStrip();
       sizeCanvas();
       updateInfo();
+      frame();                     // start rendering right away
+      // background-load the rest with gentle concurrency (no blank wait, no 18MB upfront)
+      let idx = 1;
+      const worker = async () => { while (idx < PIECES.length) await loadPiece(idx++); };
+      await Promise.all([worker(), worker(), worker(), worker()]);
     }
 
     let previewing = -1; // index being hovered, -1 = none
@@ -303,9 +308,12 @@
       for (let i = 0; i < PIECES.length; i++) {
         const thumb = document.createElement('img');
         thumb.className = 'thumb' + (i === 0 ? ' active' : '');
+        thumb.loading = 'lazy';      // defer off-screen thumbnails
+        thumb.decoding = 'async';
         thumb.src = PIECES[i].images[PIECES[i].images.length - 1];
         thumb.addEventListener('mouseenter', () => {
           previewing = i;
+          ensureLoaded(i);
           sizeCanvas(i);
           updateInfo(i);
         });
@@ -356,6 +364,7 @@
       if (transitioning) return;
       const next = ((idx % PIECES.length) + PIECES.length) % PIECES.length;
       if (next === current) return;
+      ensureLoaded(next); ensureLoaded(next + 1); ensureLoaded(next - 1); // prioritize target + neighbours
 
       // if already previewing this image, just commit instantly
       if (previewing === next) {
@@ -467,6 +476,15 @@
       const rawBlend = clamped - imgIdx;
       const blend = Math.max(0, Math.min(1, (rawBlend - 0.5) * 2 + 0.5));
 
+      // build the lens-shading gradient ONCE per frame (anchored at 0..lenticuleW);
+      // we translate it per strip instead of allocating a gradient each strip
+      const shade = ctx.createLinearGradient(0, 0, lenticuleW, 0);
+      shade.addColorStop(0, `rgba(0,0,0,${RIDGE_DARKEN})`);
+      shade.addColorStop(0.18, `rgba(0,0,0,${RIDGE_DARKEN * 0.25})`);
+      shade.addColorStop(0.5, 'rgba(0,0,0,0)');
+      shade.addColorStop(0.82, `rgba(0,0,0,${RIDGE_DARKEN * 0.25})`);
+      shade.addColorStop(1, `rgba(0,0,0,${RIDGE_DARKEN})`);
+
       for (let i = 0; i < lenticuleCount; i++) {
         const stripX = i * lenticuleW;
         const srcFrac = i / lenticuleCount;
@@ -479,34 +497,31 @@
         ctx.drawImage(srcImg, srcX, 0, srcW, srcImg.naturalHeight, stripX, 0, lenticuleW + 0.5, H);
 
         if (blend > 0.005 && imgIdx + 1 < N) {
-          const next = images[imgIdx + 1];
+          const nextImg = images[imgIdx + 1];
           ctx.globalAlpha = transAlpha * blend;
-          ctx.drawImage(next, srcFrac * next.naturalWidth, 0, next.naturalWidth / lenticuleCount, next.naturalHeight, stripX, 0, lenticuleW + 0.5, H);
+          ctx.drawImage(nextImg, srcFrac * nextImg.naturalWidth, 0, nextImg.naturalWidth / lenticuleCount, nextImg.naturalHeight, stripX, 0, lenticuleW + 0.5, H);
         }
 
-        // lens curvature shading
+        // lens curvature shading (reuse the one gradient, translated to the strip)
         ctx.globalAlpha = transAlpha;
-        const g = ctx.createLinearGradient(stripX, 0, stripX + lenticuleW, 0);
-        g.addColorStop(0, `rgba(0,0,0,${RIDGE_DARKEN})`);
-        g.addColorStop(0.18, `rgba(0,0,0,${RIDGE_DARKEN * 0.25})`);
-        g.addColorStop(0.5, 'rgba(0,0,0,0)');
-        g.addColorStop(0.82, `rgba(0,0,0,${RIDGE_DARKEN * 0.25})`);
-        g.addColorStop(1, `rgba(0,0,0,${RIDGE_DARKEN})`);
-        ctx.fillStyle = g;
-        ctx.fillRect(stripX, 0, lenticuleW, H);
+        ctx.save();
+        ctx.translate(stripX, 0);
+        ctx.fillStyle = shade;
+        ctx.fillRect(0, 0, lenticuleW, H);
+        ctx.restore();
       }
 
-      // ridge lines
+      // ridge lines — one batched path instead of a stroke per strip
       ctx.globalAlpha = transAlpha;
       ctx.strokeStyle = 'rgba(255,255,255,0.03)';
       ctx.lineWidth = 0.5;
+      ctx.beginPath();
       for (let i = 1; i < lenticuleCount; i++) {
         const x = i * lenticuleW;
-        ctx.beginPath();
         ctx.moveTo(x, 0);
         ctx.lineTo(x, H);
-        ctx.stroke();
       }
+      ctx.stroke();
 
       // specular sweep
       const specX = angle * W;
@@ -575,7 +590,7 @@
     // ══════════════════════════════════════════════
     // INIT
     // ══════════════════════════════════════════════
-    loadAll().then(() => frame());
+    loadAll(); // frame() starts inside, as soon as the first piece is ready
   </script>
 </body>
 </html>
