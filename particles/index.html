@@ -416,91 +416,141 @@
 
     const PALM_VERTS = [0, 1, 5, 9, 13, 17];
 
-    // ── Hand wireframe (Three.js LineSegments in main scene) ──
-    // Line segments: [from, to] pairs
-    const HAND_LINES = [
-      // fingers (no 0→1 or 0→5, those go through palm)
-      [1,2],[2,3],[3,4],               // thumb
-      [5,6],[6,7],[7,8],               // index
-      [9,10],[10,11],[11,12],          // middle
-      [13,14],[14,15],[15,16],         // ring
-      [17,18],[18,19],[19,20],         // pinky
-      // palm outline
-      [0,1],                           // wrist → thumb base
-      [5,9],[9,13],[13,17],            // finger base connections
-      [0,17],                          // wrist → pinky base
-      // thumb-index bridge: interpolated curve via extra points
-      // (we'll add interpolated segments in buildHandLines)
+    // ── Solid glowing hand (clean SDF silhouette, NOT metaballs) ──
+    // Fingers = tapered rounded capsule-chains (smooth, no lumps); palm = a
+    // filled, inflated polygon through wrist + knuckles. Hard union (min) keeps
+    // edges crisp. Result: a real hand outline, filled and glowing.
+    const FINGERS = [
+      { idx: [1, 2, 3, 4],     base: 0.17  }, // thumb (fatter)
+      { idx: [5, 6, 7, 8],     base: 0.14  }, // index
+      { idx: [9, 10, 11, 12],  base: 0.145 }, // middle
+      { idx: [13, 14, 15, 16], base: 0.135 }, // ring
+      { idx: [17, 18, 19, 20], base: 0.115 }  // pinky
     ];
+    const TAPER = [1.0, 0.9, 0.8, 0.7];   // radius multiplier base→tip (smooth taper)
+    const PALM = [0, 1, 5, 9, 13, 17];    // boundary: wrist→thumb base→knuckles→pinky
+    const PALM_ROUND = 0.17;              // palm inflation (fraction of hand span)
 
-    const handLineMat = new THREE.ShaderMaterial({
-      vertexShader: `void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-      fragmentShader: `void main() { gl_FragColor = vec4(0.4, 0.75, 0.9, 0.2); }`,
-      transparent: true, depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide
-    });
+    // ---- generate GLSL with literal indices (GLSL ES 1.00 safe) ----
+    let fingerGLSL = '';
+    for (const f of FINGERS) {
+      for (let s = 0; s < 3; s++) {
+        const a = f.idx[s], b = f.idx[s+1];
+        const ra = (f.base * TAPER[s]).toFixed(4);
+        const rb = (f.base * TAPER[s+1]).toFixed(4);
+        fingerGLSL += `d = min(d, sdRoundCone(p, uPts[${a}], uPts[${b}], ${ra}*uScale, ${rb}*uScale));\n          `;
+      }
+    }
+    // palm: Inigo-Quilez polygon distance, unrolled over the PALM boundary
+    let palmGLSL = `float dp = dot(p-uPts[${PALM[0]}], p-uPts[${PALM[0]}]); float sp = 1.0;\n          `;
+    for (let i = 0, j = PALM.length - 1; i < PALM.length; j = i, i++) {
+      const vi = PALM[i], vj = PALM[j];
+      palmGLSL +=
+        `{ vec2 e=uPts[${vj}]-uPts[${vi}]; vec2 w=p-uPts[${vi}];` +
+        ` vec2 b=w-e*clamp(dot(w,e)/dot(e,e),0.0,1.0); dp=min(dp,dot(b,b));` +
+        ` bvec3 c=bvec3(p.y>=uPts[${vi}].y, p.y<uPts[${vj}].y, e.x*w.y>e.y*w.x);` +
+        ` if(all(c)||all(not(c))) sp=-sp; }\n          `;
+    }
+    palmGLSL += `d = min(d, sp*sqrt(dp) - ${PALM_ROUND.toFixed(4)}*uScale);`;
 
-    // each segment = 2 triangles (quad), max ~30 segments
-    const MAX_HAND_TRIS = 80;
-    const handLineGeos = [];
-    const handLineMeshes = [];
+    const handFrag = `
+      precision highp float;
+      uniform vec2 uPts[21];
+      uniform float uScale;   // hand span (px)
+      uniform float uAA;      // edge softness (px)
+      uniform vec3 uColor;
+      varying vec2 vWorld;
+
+      // distance to a capsule with different end radii (rounded cone)
+      float sdRoundCone(vec2 p, vec2 a, vec2 b, float ra, float rb){
+        vec2 ba = b - a;
+        float l2 = max(dot(ba, ba), 1e-4);
+        float t = clamp(dot(p - a, ba)/l2, 0.0, 1.0);
+        return length(p - (a + t*ba)) - mix(ra, rb, t);
+      }
+
+      void main(){
+        vec2 p = vWorld;
+        float d = 1e5;
+        ${fingerGLSL}
+        ${palmGLSL}
+
+        float inside = smoothstep(uAA, -uAA, d);             // crisp solid fill
+        float rim    = smoothstep(0.05*uScale, 0.0, abs(d)); // bright edge band
+        float outer  = exp(max(d, 0.0) / -(0.05*uScale));    // soft halo
+        vec3 col = uColor * (0.5 + rim*1.0);
+        float alpha = inside*0.72 + outer*0.16;
+        if (alpha < 0.003) discard;
+        gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
+      }
+    `;
+    const handVert = `
+      varying vec2 vWorld;
+      void main(){
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorld = wp.xy;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `;
+
+    function makeHandMat() {
+      const pts = []; for (let i = 0; i < 21; i++) pts.push(new THREE.Vector2());
+      return new THREE.ShaderMaterial({
+        uniforms: {
+          uPts:   { value: pts },
+          uScale: { value: 100 },
+          uAA:    { value: 2 },
+          uColor: { value: new THREE.Color(0.30, 0.78, 0.88) }
+        },
+        vertexShader: handVert,
+        fragmentShader: handFrag,
+        transparent: true, depthWrite: false, depthTest: false,
+        blending: THREE.NormalBlending
+      });
+    }
+
+    // a bounding quad per hand; the SDF only runs over the hand's box
+    const handQuadGeo = new THREE.PlaneGeometry(1, 1);
+    const handScene = new THREE.Scene();
+    const handMeshes = [];
     for (let h = 0; h < 2; h++) {
-      const g = new THREE.BufferGeometry();
-      const pos = new Float32Array(MAX_HAND_TRIS * 3 * 3);
-      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-      g.setDrawRange(0, 0);
-      const mesh = new THREE.Mesh(g, handLineMat);
-      mesh.visible = false;
-      mesh.frustumCulled = false;
-      scene.add(mesh);
-      handLineGeos.push(g);
-      handLineMeshes.push(mesh);
+      const m = new THREE.Mesh(handQuadGeo, makeHandMat());
+      m.frustumCulled = false;
+      m.visible = false;
+      handScene.add(m);
+      handMeshes.push(m);
     }
 
-    const LINE_W = 3; // line thickness in pixels
+    const _p2 = []; for (let i = 0; i < 21; i++) _p2.push({ x: 0, y: 0 });
 
-    function buildHandLines(handIdx, landmarks) {
-      const pts = landmarks.map(lm => lm2scene(lm));
-      const posArr = handLineGeos[handIdx].attributes.position.array;
-      let vi = 0;
-
-      function addQuad(ax,ay, bx,by, w) {
-        const dx = bx-ax, dy = by-ay;
-        const len = Math.sqrt(dx*dx+dy*dy);
-        if (len < 0.1) return;
-        const nx = -dy/len * w, ny = dx/len * w;
-        // two triangles
-        posArr[vi++]=ax+nx; posArr[vi++]=ay+ny; posArr[vi++]=1;
-        posArr[vi++]=ax-nx; posArr[vi++]=ay-ny; posArr[vi++]=1;
-        posArr[vi++]=bx+nx; posArr[vi++]=by+ny; posArr[vi++]=1;
-        posArr[vi++]=ax-nx; posArr[vi++]=ay-ny; posArr[vi++]=1;
-        posArr[vi++]=bx-nx; posArr[vi++]=by-ny; posArr[vi++]=1;
-        posArr[vi++]=bx+nx; posArr[vi++]=by+ny; posArr[vi++]=1;
+    function updateHandMesh(handIdx, hand) {
+      const mesh = handMeshes[handIdx];
+      const u = mesh.material.uniforms;
+      const pts = u.uPts.value;
+      let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+      for (let j = 0; j < 21; j++) {
+        const x = (1 - hand[j].x) * W - W/2;
+        const y = -(hand[j].y * H - H/2);
+        _p2[j].x = x; _p2[j].y = y;
+        pts[j].set(x, y);
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
       }
+      // hand span = wrist (0) → middle knuckle (9)
+      const dx = _p2[9].x - _p2[0].x, dy = _p2[9].y - _p2[0].y;
+      const span = Math.max(40, Math.sqrt(dx*dx + dy*dy));
+      u.uScale.value = span;
+      u.uAA.value = Math.max(1.5, 0.02 * span);
 
-      // straight segments
-      for (const [a, b] of HAND_LINES) {
-        addQuad(pts[a].x, pts[a].y, pts[b].x, pts[b].y, LINE_W);
-      }
-
-      // thumb-index curve
-      const cpx = (pts[1].x + pts[2].x + pts[5].x) / 3;
-      const cpy = (pts[1].y + pts[2].y + pts[5].y) / 3;
-      const STEPS = 8;
-      for (let s = 0; s < STEPS; s++) {
-        const t0 = s / STEPS, t1 = (s + 1) / STEPS;
-        const ax = (1-t0)*(1-t0)*pts[1].x + 2*(1-t0)*t0*cpx + t0*t0*pts[5].x;
-        const ay = (1-t0)*(1-t0)*pts[1].y + 2*(1-t0)*t0*cpy + t0*t0*pts[5].y;
-        const bx = (1-t1)*(1-t1)*pts[1].x + 2*(1-t1)*t1*cpx + t1*t1*pts[5].x;
-        const by = (1-t1)*(1-t1)*pts[1].y + 2*(1-t1)*t1*cpy + t1*t1*pts[5].y;
-        addQuad(ax, ay, bx, by, LINE_W);
-      }
-
-      handLineGeos[handIdx].attributes.position.needsUpdate = true;
-      handLineGeos[handIdx].setDrawRange(0, vi / 3);
-      handLineMeshes[handIdx].visible = true;
+      const margin = 0.5 * span; // room for palm rounding + tip radius + halo
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+      const sx = (maxX - minX) + margin*2, sy = (maxY - minY) + margin*2;
+      mesh.position.set(cx, cy, 0);
+      mesh.scale.set(sx, sy, 1);
+      mesh.visible = true;
     }
+
+    function hideHandMesh(handIdx) { handMeshes[handIdx].visible = false; }
 
     function lm2scene(lm) {
       return { x: (1 - lm.x) * W - W/2, y: -(lm.y * H - H/2) };
@@ -545,13 +595,13 @@
       let results;
       try { results = handLandmarker.detectForVideo(videoEl, now); } catch(e) { return; }
 
-      for (const m of handLineMeshes) m.visible = false;
+      const nHands = (results.landmarks && results.landmarks.length) || 0;
 
-      if (results.landmarks && results.landmarks.length > 0) {
+      if (nHands > 0) {
         hasHands = true;
         interactors = [];
 
-        for (let h = 0; h < results.landmarks.length && h < 2; h++) {
+        for (let h = 0; h < nHands && h < 2; h++) {
           const hand = results.landmarks[h];
 
           // ── All 21 landmarks as repel points ──
@@ -571,12 +621,14 @@
           cx /= PALM_VERTS.length; cy /= PALM_VERTS.length;
           interactors.push(lm2scene({ x: cx, y: cy }));
 
-          // ── Update hand wireframe ──
-          buildHandLines(h, hand);
+          // ── Update solid glowing hand ──
+          updateHandMesh(h, hand);
         }
       } else {
         hasHands = false;
       }
+      // hide any hand slots not detected this frame
+      for (let h = nHands; h < 2; h++) hideHandMesh(h);
     }
 
     // Upload the active interactor points into the GPU data texture.
@@ -656,6 +708,11 @@
       //    trail buffer = accumulated fading trails + bright live particles
       compMat.uniforms.tTrail.value = writeRT.texture;
       renderer.render(compScene, trailCam);
+
+      // 3. solid glowing hand on top — crisp, no trail smear
+      renderer.autoClear = false;
+      renderer.render(handScene, camera);
+      renderer.autoClear = true;
 
       [readRT, writeRT] = [writeRT, readRT];
     }
