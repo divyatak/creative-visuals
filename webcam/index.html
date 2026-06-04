@@ -69,13 +69,9 @@
     ];
     let intensity = 1.2, time = 0;
 
-    // ── Transition ──
-    // Phases: glitch (0-40%) → pixel sort (40-65%) → unsort into new mode (65-100%)
+    // ── Transition (brief 5-frame RGB-tear glitch on mode switch) ──
     let transitioning = false, transitionFrame = 0;
-    const TRANSITION_DURATION = 55; // longer to give pixel sort time to breathe
-    let transitionOrigin = { x: 0, y: 0 };
-    let nextMode = 0, modeSwappedThisTransition = false;
-    let sortedRows = []; // pre-computed sorted pixel positions per row
+    let nextMode = 0;
 
     // ── ASCII chars by density ──
     const ASCII_CHARS = ' .:-=+*#%@';
@@ -192,32 +188,9 @@
 
     function onModeSwitch() {
       if (transitioning) return;
-      if (indexFingers.length > 0) transitionOrigin = { ...indexFingers[0] };
-      else transitionOrigin = { x: width / 2, y: height / 2 };
       nextMode = (mode + 1) % MODES;
       transitioning = true;
       transitionFrame = 0;
-      modeSwappedThisTransition = false;
-
-      // pre-compute sorted positions: for each row, sort pixels by brightness
-      sortedRows = [];
-      if (camPx) {
-        for (let row = 0; row < ROWS; row++) {
-          let rowPixels = [];
-          for (let col = 0; col < COLS; col++) {
-            let i = (row * COLS + col) * 4;
-            let b = getBright(camPx[i] || 0, camPx[i + 1] || 0, camPx[i + 2] || 0);
-            rowPixels.push({ col, bright: b });
-          }
-          rowPixels.sort((a, c) => a.bright - c.bright);
-          // map: for each original col, where does it go when sorted?
-          let mapping = new Array(COLS);
-          for (let j = 0; j < rowPixels.length; j++) {
-            mapping[rowPixels[j].col] = j; // original col → sorted position
-          }
-          sortedRows.push(mapping);
-        }
-      }
     }
 
     function doActualModeSwap() {
@@ -249,13 +222,17 @@
       }
       offCtx.drawImage(videoEl, 0, 0, COLS, ROWS);
       camPx = offCtx.getImageData(0, 0, COLS, ROWS).data;
-      if (!hiCvs) {
-        hiCvs = document.createElement('canvas');
-        hiCvs.width = 640; hiCvs.height = 480;
-        hiCtx = hiCvs.getContext('2d', { willReadFrequently: true });
+
+      // hi-res grab (~1.2MB/frame) is ONLY used by Mosaic Sharpen — skip it otherwise
+      if (mode === 5) {
+        if (!hiCvs) {
+          hiCvs = document.createElement('canvas');
+          hiCvs.width = 640; hiCvs.height = 480;
+          hiCtx = hiCvs.getContext('2d', { willReadFrequently: true });
+        }
+        hiCtx.drawImage(videoEl, 0, 0, 640, 480);
+        hiResPx = hiCtx.getImageData(0, 0, 640, 480).data;
       }
-      hiCtx.drawImage(videoEl, 0, 0, 640, 480);
-      hiResPx = hiCtx.getImageData(0, 0, 640, 480).data;
     }
 
     function getInteractors() {
@@ -368,7 +345,7 @@
       // quick glitch — 5 frames of channel split then done
       if (transitioning) {
         transitionFrame++;
-        if (transitionFrame === 1) { doActualModeSwap(); modeSwappedThisTransition = true; }
+        if (transitionFrame === 1) { doActualModeSwap(); }
         if (transitionFrame >= 5) { transitioning = false; }
         // draw normal mode but with RGB tear
         drawNormalMode();
@@ -611,82 +588,6 @@
         }
       }
 
-    }
-
-    // ── Glitch transition ──
-    function drawGlitchTransition() {
-      let t = transitionFrame / TRANSITION_DURATION;
-      let ox = transitionOrigin.x, oy = transitionOrigin.y;
-      // glitch runs for first 40% of transition
-      let gt = constrain(t / 0.4, 0, 1);
-      let gi;
-      if (gt < 0.4) gi = map(gt, 0, 0.4, 0, 1);       // ramp up
-      else gi = 1;                                       // hold at max
-      gi *= gi;
-
-      for (let i = 0; i < grid.length; i++) {
-        let g = grid[i];
-        let [rawR, rawG, rawB] = getRawColor(g.row, g.col);
-        let useMode = modeSwappedThisTransition ? nextMode : mode;
-        let [cr, cg, cb] = treatColor(rawR, rawG, rawB, useMode);
-        let dx = g.hx - ox, dy = g.hy - oy;
-        let d = Math.sqrt(dx * dx + dy * dy);
-        let proxFactor = d < 400 ? map(d, 0, 400, 1.5, 0.5) : 0.5;
-        let gf = gi * proxFactor * intensity;
-
-        let offX = g.hx + (Math.random() - 0.5) * 30 * gf;
-        let offY = g.hy + (Math.random() - 0.5) * 30 * gf;
-        let splitAmt = floor(3 * gf);
-        let rIdx = (g.row * COLS + constrain(g.col + splitAmt, 0, COLS - 1)) * 4;
-        let bIdx = (g.row * COLS + constrain(g.col - splitAmt, 0, COLS - 1)) * 4;
-        let sr = camPx[rIdx] || cr, sb = camPx[bIdx + 2] || cb;
-        let flicker = Math.random() < 0.1 * gf ? 0 : 1;
-
-        noStroke();
-        fill(sr * flicker, cg * flicker, sb * flicker);
-        let sz = cellSize * (1 + Math.random() * 0.5 * gf);
-        rect(offX - sz / 2, offY - sz / 2, sz, sz);
-      }
-    }
-
-    // ── Pixel sort transition ──
-    function drawPixelSortTransition() {
-      let t = transitionFrame / TRANSITION_DURATION;
-      // sort phase: 0.4→0.65, unsort phase: 0.65→1.0
-      let sortPeakT = 0.65;
-      let sortAmount; // 0 = normal positions, 1 = fully sorted
-      if (t < sortPeakT) {
-        sortAmount = map(t, 0.4, sortPeakT, 0, 1);
-        sortAmount = sortAmount * sortAmount; // ease in
-      } else {
-        sortAmount = map(t, sortPeakT, 1, 1, 0);
-        sortAmount = sortAmount * sortAmount; // ease out
-      }
-      sortAmount = constrain(sortAmount, 0, 1);
-
-      let useMode = modeSwappedThisTransition ? nextMode : mode;
-
-      noStroke();
-      for (let i = 0; i < grid.length; i++) {
-        let g = grid[i];
-        let [rawR, rawG, rawB] = getRawColor(g.row, g.col);
-        let [cr, cg, cb] = treatColor(rawR, rawG, rawB, useMode);
-
-        // where does this pixel go when sorted?
-        let sortedCol = sortedRows[g.row] ? sortedRows[g.row][g.col] : g.col;
-        let sortedX = gridOffsetX + (COLS - 1 - sortedCol) * cellSize + cellSize / 2;
-
-        // lerp between home position and sorted position
-        let drawX = lerp(g.hx, sortedX, sortAmount);
-        let drawY = g.hy; // stays on same row
-
-        // slight remaining glitch jitter during sort (decreasing)
-        let jitter = sortAmount * (1 - sortAmount) * 4; // peaks at mid-sort
-        drawX += (Math.random() - 0.5) * jitter * intensity;
-
-        fill(cr, cg, cb);
-        rect(drawX - cellSize / 2, drawY - cellSize / 2, cellSize + 0.5, cellSize + 0.5);
-      }
     }
 
     // ── Finger glow ──
