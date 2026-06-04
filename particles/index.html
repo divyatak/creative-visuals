@@ -31,19 +31,26 @@
   <script type="importmap">
   {
     "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
     }
   }
   </script>
   <script type="module">
     import * as THREE from 'three';
+    import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
     import { HandLandmarker, FilesetResolver } from
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
 
     // ══════════════════════════════════════════════
     // CONFIG
     // ══════════════════════════════════════════════
-    const PARTICLE_COUNT = 25000;
+    // Particle state lives in two float textures (TEX_SIZE²) and is stepped
+    // entirely on the GPU (GPGPU ping-pong). The CPU only updates a handful of
+    // uniforms + the interactor positions each frame — no per-particle loop.
+    const TEX_SIZE = 158;                       // 158² = 24964 particles (~25k)
+    const PARTICLE_COUNT = TEX_SIZE * TEX_SIZE;
+    const MAX_POINTS = 130;                      // interactor texture width (hands ~74, mouse 1)
     const PHASE_DURATION = 20;
     const W = window.innerWidth, H = window.innerHeight;
 
@@ -54,13 +61,8 @@
     const PIXEL_RATIO = IS_MOBILE ? Math.min(window.devicePixelRatio, 1.5)
                                   : Math.min(window.devicePixelRatio, 2);
 
-    // ── Flow-field grid: sample a low-res precomputed field instead of
-    //    running ~40 trig ops per particle per frame. Field is very
-    //    low-frequency in screen space, so a coarse grid + bilinear is exact-enough.
-    const GW = IS_MOBILE ? 48 : 80;   // grid columns
-    const GH = IS_MOBILE ? 27 : 45;   // grid rows
-    const fieldX = new Float32Array(GW * GH);
-    const fieldY = new Float32Array(GW * GH);
+    const FLOW_STR = 0.35;       // gentle ocean drift strength
+    const FLOW_SCALE = 0.0015;   // flow field spatial scale
 
     // ══════════════════════════════════════════════
     // RENDERER + CAMERA
@@ -113,64 +115,250 @@
     compScene.add(compQuad);
 
     // ══════════════════════════════════════════════
-    // PARTICLES
+    // SHARED GLSL (hash + curl-noise flow field)
     // ══════════════════════════════════════════════
-    const positions = new Float32Array(PARTICLE_COUNT * 3);
-    const velocities = new Float32Array(PARTICLE_COUNT * 2);
-    const seeds = new Float32Array(PARTICLE_COUNT);
-    const lifetimes = new Float32Array(PARTICLE_COUNT);
-    const ages = new Float32Array(PARTICLE_COUNT);
-    const maxAges = new Float32Array(PARTICLE_COUNT);
-    const hueOffsets = new Float32Array(PARTICLE_COUNT);
-    const excitation = new Float32Array(PARTICLE_COUNT); // 0=dark, 1=fully glowing
+    const GLSL_HASH = `
+      float hash11(float p){ p=fract(p*0.1031); p*=p+33.33; p*=p+p; return fract(p); }
+      float hash12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*0.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+    `;
+    const GLSL_FLOW = `
+      float flowAngle(float x,float y,float t,float s){
+        float v = sin(x*s*1.1+t*0.3)+sin(y*s*0.9+t*0.2);
+        v += sin(x*s*0.7-t*0.25)+cos(y*s*1.3+t*0.35);
+        v += sin((x+y)*s*0.5+t*0.15);
+        float s2=s*2.5;
+        v += (sin(x*s2+t*0.6)+cos(y*s2*1.2-t*0.5))*0.5;
+        v += sin((x-y)*s2*0.8+t*0.45)*0.4;
+        float s3=s*6.0;
+        v += (sin(x*s3+t*1.2)+sin(y*s3+t*0.9))*0.2;
+        return v*0.65;
+      }
+      float curlX(float x,float y,float t,float s){ float e=1.5; return (flowAngle(x,y+e,t,s)-flowAngle(x,y-e,t,s))/(e*2.0); }
+      float curlY(float x,float y,float t,float s){ float e=1.5; return -(flowAngle(x+e,y,t,s)-flowAngle(x-e,y,t,s))/(e*2.0); }
+    `;
 
-    function respawn(i) {
-      positions[i*3]     = (Math.random() - 0.5) * W;
-      positions[i*3 + 1] = (Math.random() - 0.5) * H;
-      positions[i*3 + 2] = 0;
-      velocities[i*2]     = (Math.random() - 0.5) * 0.3;
-      velocities[i*2 + 1] = (Math.random() - 0.5) * 0.3;
-      seeds[i] = Math.random() * 1000;
-      ages[i] = 0;
-      maxAges[i] = 6 + Math.random() * 14; // longer lives — algae persist
-      // weighted color pick: 25% teal, 45% cyan, 10% blue, 10% purple, 10% green
-      const roll = Math.random();
-      if (roll < 0.25) hueOffsets[i] = 0.47 + Math.random() * 0.03;       // teal
-      else if (roll < 0.70) hueOffsets[i] = 0.50 + Math.random() * 0.03;  // cyan
-      else if (roll < 0.80) hueOffsets[i] = 0.58 + Math.random() * 0.04;  // blue
-      else if (roll < 0.90) hueOffsets[i] = 0.72 + Math.random() * 0.06;  // purple
-      else hueOffsets[i] = 0.38 + Math.random() * 0.04;                   // green
-      excitation[i] = 0;
+    // ══════════════════════════════════════════════
+    // GPU PARTICLE SIMULATION
+    // ══════════════════════════════════════════════
+    // texPos : xy = position (centered scene coords), zw = velocity
+    // texData: x = age, y = maxAge, z = excitation (0..1 glow), w = hue
+    const gpu = new GPUComputationRenderer(TEX_SIZE, TEX_SIZE, renderer);
+
+    const pos0 = gpu.createTexture();
+    const data0 = gpu.createTexture();
+    (function seedInitialState() {
+      const pd = pos0.image.data, dd = data0.image.data;
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        pd[i*4]   = (Math.random() - 0.5) * W;
+        pd[i*4+1] = (Math.random() - 0.5) * H;
+        pd[i*4+2] = (Math.random() - 0.5) * 0.3;
+        pd[i*4+3] = (Math.random() - 0.5) * 0.3;
+        const maxAge = 6 + Math.random() * 14; // longer lives — algae persist
+        // weighted color pick: 25% teal, 45% cyan, 10% blue, 10% purple, 10% green
+        const roll = Math.random();
+        let hue;
+        if (roll < 0.25) hue = 0.47 + Math.random() * 0.03;
+        else if (roll < 0.70) hue = 0.50 + Math.random() * 0.03;
+        else if (roll < 0.80) hue = 0.58 + Math.random() * 0.04;
+        else if (roll < 0.90) hue = 0.72 + Math.random() * 0.06;
+        else hue = 0.38 + Math.random() * 0.04;
+        dd[i*4]   = Math.random() * maxAge; // random starting age → staggered lifecycles
+        dd[i*4+1] = maxAge;
+        dd[i*4+2] = 0;
+        dd[i*4+3] = hue;
+      }
+    })();
+
+    // ── Interactor positions (hands/mouse) passed to the GPU as a data texture ──
+    const interactorData = new Float32Array(MAX_POINTS * 4);
+    const interactorTex = new THREE.DataTexture(
+      interactorData, MAX_POINTS, 1, THREE.RGBAFormat, THREE.FloatType
+    );
+    interactorTex.needsUpdate = true;
+
+    // ── Position/velocity step ──
+    const posFrag = `
+      uniform float uTime, uDt, uW, uH, uFlowStr, uFlowScale, uRadBase;
+      uniform sampler2D uInteractors;
+      uniform int uCount;
+      ${GLSL_HASH}
+      ${GLSL_FLOW}
+      void main(){
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 P = texture2D(texPos, uv);
+        vec4 D = texture2D(texData, uv);
+        float age = D.x; float maxAge = D.y;
+        float sb = uTime*13.31 + hash12(uv)*101.7;
+
+        // respawn at random position when life ends
+        if (age + uDt >= maxAge) {
+          float nx  = (hash11(sb+1.1)-0.5)*uW;
+          float ny  = (hash11(sb+2.2)-0.5)*uH;
+          float nvx = (hash11(sb+3.3)-0.5)*0.3;
+          float nvy = (hash11(sb+4.4)-0.5)*0.3;
+          gl_FragColor = vec4(nx, ny, nvx, nvy);
+          return;
+        }
+
+        vec2 pos = P.xy; vec2 vel = P.zw;
+
+        // gentle ocean drift (curl noise)
+        float t = uTime*0.4;
+        float fx = curlX(pos.x, pos.y, t, uFlowScale)*uFlowStr;
+        float fy = curlY(pos.x, pos.y, t, uFlowScale)*uFlowStr;
+
+        // disturbance: repel from each interactor point
+        float seed = hash12(uv)*1000.0;
+        float radNoise = 0.7 + 0.6*(sin(seed*3.7 + uTime*2.0)*0.5+0.5);
+        float rad = uRadBase*radNoise;
+        vec2 repel = vec2(0.0);
+        for (int p=0; p<${MAX_POINTS}; p++){
+          if (p >= uCount) break;
+          vec4 it = texture2D(uInteractors, vec2((float(p)+0.5)/${MAX_POINTS}.0, 0.5));
+          vec2 d = pos - it.xy;
+          float dist = length(d);
+          if (dist < rad && dist > 0.1){
+            float inf = 1.0 - dist/rad;
+            repel += (d/dist)*inf*0.25;
+          }
+        }
+
+        // shimmer jitter
+        float jb = uTime*57.0 + hash12(uv)*123.0;
+        float jx = (hash11(jb+0.7)-0.5)*0.15;
+        float jy = (hash11(jb+9.1)-0.5)*0.15;
+
+        vel += (vec2(fx,fy) + repel + vec2(jx,jy)) * uDt * 60.0;
+        vel *= 0.98; // less damping — drift further
+        pos += vel;
+
+        // wrap around edges
+        float hw = uW*0.5+50.0, hh = uH*0.5+50.0;
+        if (pos.x < -hw) pos.x += uW+100.0;
+        if (pos.x >  hw) pos.x -= uW+100.0;
+        if (pos.y < -hh) pos.y += uH+100.0;
+        if (pos.y >  hh) pos.y -= uH+100.0;
+
+        gl_FragColor = vec4(pos, vel);
+      }
+    `;
+
+    // ── Age / excitation / hue step ──
+    const dataFrag = `
+      uniform float uTime, uDt, uRadBase;
+      uniform sampler2D uInteractors;
+      uniform int uCount;
+      ${GLSL_HASH}
+      void main(){
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 P = texture2D(texPos, uv);
+        vec4 D = texture2D(texData, uv);
+        float age=D.x; float maxAge=D.y; float exc=D.z; float hue=D.w;
+        float sb = uTime*13.31 + hash12(uv)*101.7;
+
+        // respawn — new lifespan + fresh color
+        if (age + uDt >= maxAge){
+          float newMax = 6.0 + hash11(sb+5.5)*14.0;
+          float roll = hash11(sb+6.6);
+          float hb = hash11(sb+7.7);
+          float nh;
+          if (roll<0.25) nh=0.47+hb*0.03;
+          else if (roll<0.70) nh=0.50+hb*0.03;
+          else if (roll<0.80) nh=0.58+hb*0.04;
+          else if (roll<0.90) nh=0.72+hb*0.06;
+          else nh=0.38+hb*0.04;
+          gl_FragColor = vec4(0.0, newMax, 0.0, nh);
+          return;
+        }
+
+        // excite when disturbed by an interactor, else decay
+        vec2 pos = P.xy;
+        float seed = hash12(uv)*1000.0;
+        float radNoise = 0.7 + 0.6*(sin(seed*3.7 + uTime*2.0)*0.5+0.5);
+        float rad = uRadBase*radNoise;
+        bool disturbed = false;
+        for (int p=0; p<${MAX_POINTS}; p++){
+          if (p >= uCount) break;
+          vec4 it = texture2D(uInteractors, vec2((float(p)+0.5)/${MAX_POINTS}.0, 0.5));
+          vec2 d = pos - it.xy;
+          float dist = length(d);
+          if (dist < rad && dist > 0.1){
+            float inf = 1.0 - dist/rad;
+            exc = min(1.0, exc + inf*0.06);
+            disturbed = true;
+          }
+        }
+        if (!disturbed) exc *= 0.95;
+
+        age += uDt;
+        gl_FragColor = vec4(age, maxAge, exc, hue);
+      }
+    `;
+
+    const posVar = gpu.addVariable('texPos', posFrag, pos0);
+    const dataVar = gpu.addVariable('texData', dataFrag, data0);
+    gpu.setVariableDependencies(posVar, [posVar, dataVar]);
+    gpu.setVariableDependencies(dataVar, [posVar, dataVar]);
+
+    // uniforms shared by both compute passes
+    Object.assign(posVar.material.uniforms, {
+      uTime: { value: 0 }, uDt: { value: 0.016 },
+      uW: { value: W }, uH: { value: H },
+      uFlowStr: { value: FLOW_STR }, uFlowScale: { value: FLOW_SCALE },
+      uRadBase: { value: 60 },
+      uInteractors: { value: interactorTex }, uCount: { value: 0 }
+    });
+    Object.assign(dataVar.material.uniforms, {
+      uTime: { value: 0 }, uDt: { value: 0.016 },
+      uRadBase: { value: 60 },
+      uInteractors: { value: interactorTex }, uCount: { value: 0 }
+    });
+
+    const gpuErr = gpu.init();
+    if (gpuErr !== null) console.error('GPUComputationRenderer error:', gpuErr);
+
+    // ── Render material: reads particle state straight from the sim textures ──
+    const refs = new Float32Array(PARTICLE_COUNT * 2);
+    for (let j = 0, k = 0; j < TEX_SIZE; j++) {
+      for (let i = 0; i < TEX_SIZE; i++, k++) {
+        refs[k*2]   = (i + 0.5) / TEX_SIZE;
+        refs[k*2+1] = (j + 0.5) / TEX_SIZE;
+      }
     }
-
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-      respawn(i);
-      ages[i] = Math.random() * maxAges[i];
-    }
-
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
-    geo.setAttribute('aLife', new THREE.BufferAttribute(lifetimes, 1));
-    geo.setAttribute('aHueOff', new THREE.BufferAttribute(hueOffsets, 1));
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(PARTICLE_COUNT * 3), 3));
+    geo.setAttribute('reference', new THREE.BufferAttribute(refs, 2));
 
     const pMat = new THREE.ShaderMaterial({
       uniforms: {
-        uPhase: { value: 0 },
-        uMouseActive: { value: 0 }
+        texPos: { value: null },
+        texData: { value: null },
+        uTime: { value: 0 }
       },
       vertexShader: `
-        attribute float aSeed;
-        attribute float aLife; // encodes: ageFade * (ambient + excitation)
-        attribute float aHueOff;
+        uniform sampler2D texPos;
+        uniform sampler2D texData;
+        uniform float uTime;
+        attribute vec2 reference;
         varying float vAlpha;
         varying float vHue;
+        float hash12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*0.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
         void main() {
-          vAlpha = aLife * 1.3;
-          vHue = aHueOff;
-          float sz = 3.0 + aLife * 2.5; // brighter = bigger glow
-          gl_PointSize = sz;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
+          vec4 P = texture2D(texPos, reference);
+          vec4 D = texture2D(texData, reference);
+          float age=D.x; float maxAge=D.y; float exc=D.z; float hue=D.w;
+          float ageNorm = age/maxAge;
+          float fadeIn = min(1.0, ageNorm/0.1);
+          float fadeOut = min(1.0, (1.0-ageNorm)/0.2);
+          float ageFade = fadeIn*fadeOut;
+          // breathing ambient: each particle gently pulses at its own rate
+          float seed = hash12(reference)*1000.0;
+          float breath = 0.08 + 0.03*sin(uTime*(0.3 + seed*0.0004) + seed);
+          float life = ageFade * (breath + exc*0.8);
+          vAlpha = life * 1.3;
+          vHue = hue;
+          gl_PointSize = 3.0 + life * 2.5; // brighter = bigger glow
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(P.xy, 0.0, 1.);
         }
       `,
       fragmentShader: `
@@ -187,7 +375,6 @@
           float d = length(gl_PointCoord - .5) * 2.;
           if (d > 1.) discard;
           float a = (1.-d*d) * vAlpha;
-          // hue set directly per particle (teal/cyan/blue/purple/green)
           float h = vHue;
           vec3 c = hue2rgb(h);
           // when excited, push toward bright white-cyan
@@ -199,67 +386,9 @@
       blending: THREE.AdditiveBlending
     });
 
-    scene.add(new THREE.Points(geo, pMat));
-
-    // ══════════════════════════════════════════════
-    // FLOW FIELD (curl noise via sin layers)
-    // ══════════════════════════════════════════════
-    // multi-octave flow for organic, alive movement
-    function flowAngle(x, y, t, s) {
-      // octave 1: large-scale currents
-      let v = Math.sin(x*s*1.1 + t*.3) + Math.sin(y*s*.9 + t*.2);
-      v += Math.sin(x*s*.7 - t*.25) + Math.cos(y*s*1.3 + t*.35);
-      v += Math.sin((x+y)*s*.5 + t*.15);
-      // octave 2: medium turbulence
-      const s2 = s * 2.5;
-      v += (Math.sin(x*s2 + t*.6) + Math.cos(y*s2*1.2 - t*.5)) * 0.5;
-      v += Math.sin((x-y)*s2*.8 + t*.45) * 0.4;
-      // octave 3: fine detail / shimmer
-      const s3 = s * 6;
-      v += (Math.sin(x*s3 + t*1.2) + Math.sin(y*s3 + t*.9)) * 0.2;
-      return v * 0.65;
-    }
-    function curlX(x,y,t,s){ const e=1.5; return (flowAngle(x,y+e,t,s)-flowAngle(x,y-e,t,s))/(e*2); }
-    function curlY(x,y,t,s){ const e=1.5; return -(flowAngle(x+e,y,t,s)-flowAngle(x-e,y,t,s))/(e*2); }
-
-    // Rebuild the low-res flow field once per frame (GW*GH curl evals instead
-    // of one per particle). Node (gx,gy) maps to centered world coords.
-    function buildFlowField(t, s) {
-      for (let gy = 0; gy < GH; gy++) {
-        const wy = (gy / (GH - 1)) * H - H/2;
-        for (let gx = 0; gx < GW; gx++) {
-          const wx = (gx / (GW - 1)) * W - W/2;
-          const idx = gy * GW + gx;
-          fieldX[idx] = curlX(wx, wy, t, s);
-          fieldY[idx] = curlY(wx, wy, t, s);
-        }
-      }
-    }
-    // Bilinear sample of the field at centered world coords. Writes into flowOut.
-    const flowOut = [0, 0];
-    function sampleFlow(px, py) {
-      let gx = (px + W/2) / W * (GW - 1);
-      let gy = (py + H/2) / H * (GH - 1);
-      if (gx < 0) gx = 0; else if (gx > GW - 1.001) gx = GW - 1.001;
-      if (gy < 0) gy = 0; else if (gy > GH - 1.001) gy = GH - 1.001;
-      const x0 = gx | 0, y0 = gy | 0;
-      const tx = gx - x0, ty = gy - y0;
-      const i00 = y0 * GW + x0, i10 = i00 + 1, i01 = i00 + GW, i11 = i01 + 1;
-      const w00 = (1-tx)*(1-ty), w10 = tx*(1-ty), w01 = (1-tx)*ty, w11 = tx*ty;
-      flowOut[0] = fieldX[i00]*w00 + fieldX[i10]*w10 + fieldX[i01]*w01 + fieldX[i11]*w11;
-      flowOut[1] = fieldY[i00]*w00 + fieldY[i10]*w10 + fieldY[i01]*w01 + fieldY[i11]*w11;
-    }
-
-    // Precomputed jitter table — avoids 50k Math.random() calls/frame in the hot loop.
-    const JITTER_N = 2048;
-    const jitter = new Float32Array(JITTER_N);
-    for (let i = 0; i < JITTER_N; i++) jitter[i] = (Math.random() - 0.5) * 0.15;
-    let jitterPtr = 0;
-
-    // Spatial buckets for interactor points so each particle only tests nearby
-    // hand/mouse points instead of all ~120 of them. Reused across frames.
-    const INTERACT_CELL = 140; // must be >= max disturbance radius
-    const interactorBuckets = new Map();
+    const particlePoints = new THREE.Points(geo, pMat);
+    particlePoints.frustumCulled = false; // positions live in the texture, not the attribute
+    scene.add(particlePoints);
 
     // ══════════════════════════════════════════════
     // INTERACTION POINTS (hands + mouse fallback)
@@ -450,6 +579,19 @@
       }
     }
 
+    // Upload the active interactor points into the GPU data texture.
+    function updateInteractorTexture(points) {
+      const n = Math.min(points.length, MAX_POINTS);
+      for (let p = 0; p < n; p++) {
+        interactorData[p*4]   = points[p].x;
+        interactorData[p*4+1] = points[p].y;
+        interactorData[p*4+2] = 1;
+        interactorData[p*4+3] = 0;
+      }
+      interactorTex.needsUpdate = true;
+      return n;
+    }
+
     // ══════════════════════════════════════════════
     // ANIMATE
     // ══════════════════════════════════════════════
@@ -457,7 +599,6 @@
     const totalCycle = PHASE_DURATION * 3;
     const phaseEl = document.getElementById('phase-label');
     const NAMES = ['reveal', 'disturb', 'draw'];
-    let smoothMouseActive = 0;
     let hintVisible = true;
     let idleTime = 0;
     const hintEl = document.getElementById('hint');
@@ -472,123 +613,24 @@
       const phase = Math.min((time % totalCycle) / PHASE_DURATION, 2.999);
       phaseEl.textContent = NAMES[Math.floor(phase)];
 
-      const reveal  = Math.max(0, 1 - phase);
       const disturb = 1 - Math.abs(phase - 1);
-      const draw    = Math.max(0, phase - 1.5) * 2;
-
       const mouseRadBase = 60 + disturb * 40;
-      const flowStr    = 0.35; // gentle ocean drift
-      const flowScale  = 0.0015;
       // breathing: trail persistence oscillates → whole field gently pulses
       fadeMat.uniforms.fade.value = 0.91 + 0.015 * Math.sin(time * 0.3);
 
-      // ── Rebuild low-res flow field once (instead of per particle) ──
-      buildFlowField(time * 0.4, flowScale);
-
-      // ── Bucket the active interactor points for fast neighbour lookup ──
+      // ── Feed interactor points + sim params to the GPU ──
       const points = hasHands ? interactors : (mouseIn ? [{x: mouseX, y: mouseY}] : []);
-      interactorBuckets.clear();
-      for (let p = 0; p < points.length; p++) {
-        const cx = Math.floor((points[p].x + W/2) / INTERACT_CELL) + 1000;
-        const cy = Math.floor((points[p].y + H/2) / INTERACT_CELL) + 1000;
-        const key = cx * 100000 + cy;
-        let arr = interactorBuckets.get(key);
-        if (!arr) { arr = []; interactorBuckets.set(key, arr); }
-        arr.push(p);
-      }
-      const hasPoints = points.length > 0;
+      const count = updateInteractorTexture(points);
 
-      const posArr = geo.attributes.position.array;
-      const lifeArr = geo.attributes.aLife.array;
-      let mouseActiveSum = 0;
-      let anyRespawn = false;
-      const hw = W/2+50, hh = H/2+50;
+      const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
+      pu.uTime.value = time; pu.uDt.value = dt; pu.uRadBase.value = mouseRadBase; pu.uCount.value = count;
+      du.uTime.value = time; du.uDt.value = dt; du.uRadBase.value = mouseRadBase; du.uCount.value = count;
 
-      for (let i = 0; i < PARTICLE_COUNT; i++) {
-        const ix = i*3, iy = i*3+1, ivx = i*2, ivy = i*2+1;
-
-        // ── Age + lifecycle ──
-        ages[i] += dt;
-        const ageNorm = ages[i] / maxAges[i]; // 0→1
-        if (ageNorm >= 1) {
-          respawn(i);           // writes hueOffsets[i] (= aHueOff buffer) directly
-          anyRespawn = true;
-          continue;
-        }
-        // fade in first 10%, fade out last 20%
-        const fadeIn = Math.min(1, ageNorm / 0.1);
-        const fadeOut = Math.min(1, (1 - ageNorm) / 0.2);
-        const ageFade = fadeIn * fadeOut;
-        // breathing ambient: each particle gently pulses at its own rate
-        const breath = 0.08 + 0.03 * Math.sin(time * (0.3 + seeds[i] * 0.0004) + seeds[i]);
-        lifeArr[i] = ageFade * (breath + excitation[i] * 0.8);
-
-        let px = posArr[ix], py = posArr[iy];
-
-        // ── Gentle ocean drift (bilinear sample of precomputed field) ──
-        sampleFlow(px, py);
-        const fx = flowOut[0] * flowStr;
-        const fy = flowOut[1] * flowStr;
-
-        // ── Disturbance: repel + excite (only nearby interactor cells) ──
-        let mx = 0, my = 0;
-        const radNoise = 0.7 + 0.6 * (Math.sin(seeds[i] * 3.7 + time * 2) * 0.5 + 0.5);
-        const rad = mouseRadBase * radNoise;
-        const rad2 = rad * rad;
-        let disturbed = false;
-        if (hasPoints) {
-          const pcx = Math.floor((px + W/2) / INTERACT_CELL) + 1000;
-          const pcy = Math.floor((py + H/2) / INTERACT_CELL) + 1000;
-          for (let ddx = -1; ddx <= 1; ddx++) {
-            for (let ddy = -1; ddy <= 1; ddy++) {
-              const arr = interactorBuckets.get((pcx+ddx) * 100000 + (pcy+ddy));
-              if (!arr) continue;
-              for (let k = 0; k < arr.length; k++) {
-                const pt = points[arr[k]];
-                const dx = px - pt.x, dy = py - pt.y;
-                const d2 = dx*dx + dy*dy;
-                if (d2 < rad2 && d2 > 0.01) {
-                  const dist = Math.sqrt(d2);
-                  const inf = 1 - dist/rad;
-                  mouseActiveSum += inf;
-                  mx += dx/dist * inf * 0.25;
-                  my += dy/dist * inf * 0.25;
-                  excitation[i] = Math.min(1, excitation[i] + inf * 0.06);
-                  disturbed = true;
-                }
-              }
-            }
-          }
-        }
-        // excitation decays slowly
-        if (!disturbed) excitation[i] *= 0.95; // fast glow decay
-
-        const jx = jitter[jitterPtr]; jitterPtr = (jitterPtr + 1) & (JITTER_N - 1);
-        const jy = jitter[jitterPtr]; jitterPtr = (jitterPtr + 1) & (JITTER_N - 1);
-        velocities[ivx] += (fx + mx + jx) * dt * 60;
-        velocities[ivy] += (fy + my + jy) * dt * 60;
-        velocities[ivx] *= 0.98; // less damping — drift further
-        velocities[ivy] *= 0.98;
-
-        posArr[ix] += velocities[ivx];
-        posArr[iy] += velocities[ivy];
-
-        // wrap
-        if (posArr[ix] < -hw) posArr[ix] += W+100;
-        if (posArr[ix] >  hw) posArr[ix] -= W+100;
-        if (posArr[iy] < -hh) posArr[iy] += H+100;
-        if (posArr[iy] >  hh) posArr[iy] -= H+100;
-      }
-
-      geo.attributes.position.needsUpdate = true;
-      geo.attributes.aLife.needsUpdate = true;
-      if (anyRespawn) geo.attributes.aHueOff.needsUpdate = true; // hue only changes on respawn
-
-      const mouseActive = Math.min(1, mouseActiveSum / 200);
-      smoothMouseActive += ((mouseIn ? Math.max(mouseActive, 0.3) : 0) - smoothMouseActive) * 0.05;
-
-      pMat.uniforms.uPhase.value = phase;
-      pMat.uniforms.uMouseActive.value = smoothMouseActive;
+      // ── Step the simulation on the GPU ──
+      gpu.compute();
+      pMat.uniforms.texPos.value = gpu.getCurrentRenderTarget(posVar).texture;
+      pMat.uniforms.texData.value = gpu.getCurrentRenderTarget(dataVar).texture;
+      pMat.uniforms.uTime.value = time;
 
       // hint text: hide on activity, show after idle
       if (hasHands || mouseIn) {
