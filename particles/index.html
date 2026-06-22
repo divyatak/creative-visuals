@@ -20,35 +20,42 @@
       color: rgba(255,255,255,0.12);
       pointer-events: none; z-index: 10;
     }
-    #panel {
+    #panels {
       position: fixed; top: 16px; right: 16px; z-index: 20;
-      width: 232px; max-height: 92vh; overflow-y: auto;
+      display: flex; flex-direction: column; gap: 10px; align-items: flex-end;
+      max-height: 92vh; overflow-y: auto;
+    }
+    .panel {
+      width: 232px;
       background: rgba(8,16,20,0.72); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
       border: 1px solid rgba(120,200,220,0.18); border-radius: 10px;
       padding: 10px 12px; font: 11px monospace; color: rgba(200,235,245,0.85);
       cursor: auto; user-select: none;
     }
-    #panel.collapsed .row, #panel.collapsed #panel-foot { display: none; }
-    #panel h3 {
+    .panel.collapsed .row, .panel.collapsed .panel-foot { display: none; }
+    .panel h3 {
       font-size: 11px; letter-spacing: 1px; font-weight: normal; margin: 0 0 6px;
       color: rgba(160,220,235,0.7); display: flex; justify-content: space-between; cursor: pointer;
     }
-    #panel .row { margin: 7px 0; }
-    #panel .row label { display: flex; justify-content: space-between; margin-bottom: 2px; color: rgba(190,225,235,0.65); }
-    #panel .row label span { color: rgba(150,235,210,0.95); }
-    #panel input[type=range] { width: 100%; height: 14px; accent-color: #5fd8c8; cursor: pointer; }
-    #panel-foot { margin-top: 10px; display: flex; gap: 8px; }
-    #panel-foot button {
+    .panel .row { margin: 7px 0; }
+    .panel .row label { display: flex; justify-content: space-between; margin-bottom: 2px; color: rgba(190,225,235,0.65); }
+    .panel .row label span { color: rgba(150,235,210,0.95); }
+    .panel input[type=range] { width: 100%; height: 14px; accent-color: #5fd8c8; cursor: pointer; }
+    .panel-foot { margin-top: 10px; display: flex; gap: 8px; }
+    .panel-foot button {
       flex: 1; background: rgba(95,216,200,0.12); color: rgba(180,235,225,0.9);
       border: 1px solid rgba(120,200,220,0.25); border-radius: 6px; padding: 5px; font: 10px monospace; cursor: pointer;
     }
-    #panel-foot button:hover { background: rgba(95,216,200,0.22); }
+    .panel-foot button:hover { background: rgba(95,216,200,0.22); }
   </style>
 </head>
 <body>
   <a id="back" href="../">&larr; back</a>
   <div id="phase-label"></div>
-  <div id="panel"></div>
+  <div id="panels">
+    <div id="panel" class="panel"></div>
+    <div id="panel2" class="panel"></div>
+  </div>
   <div id="hint" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font:20px monospace;color:rgba(255,255,255,0.35);letter-spacing:3px;pointer-events:none;z-index:10;transition:opacity 1.5s;">allow camera to see magic</div>
   <video id="video" playsinline style="display:none;"></video>
 
@@ -89,24 +96,40 @@
 
     // ── Live-tunable parameters (persisted to localStorage; see control panel) ──
     const DEFAULTS = {
-      baseGlow:   0.14,   // resting particle brightness
-      excGlow:    0.50,   // extra brightness when disturbed
-      alpha:      1.46,   // overall particle opacity / glow
-      flowStr:    0.14,   // base-particle drift strength (how much they move)
-      flowSpeed:  1.50,   // how fast the currents evolve (base-particle speed)
-      damping:    0.942,  // velocity retention (higher = floatier, more movement)
-      jitter:     0.30,   // shimmer
-      trail:      0.94,   // trail persistence (higher = longer trails)
+      // ── particle appearance / lifecycle (see ✦ particles panel) ──
+      baseGlow:   0.20,   // resting particle brightness
+      excGlow:    0.0,    // extra brightness when disturbed
+      alpha:      1.32,   // overall particle opacity / glow
+      hueShift:   0.0,    // rotate every particle's hue (0..1 = full colour wheel)
+      sat:        1.0,    // colour saturation (0 = grayscale, 1 = full)
+      pointSize:  2.9,    // base particle size (px)
+      sizeGlow:   1.4,    // how much brighter particles also grow
+      lifeMin:    1.5,    // shortest lifespan (s) — lower = faster regen
+      lifeRange:  30.0,   // spread of lifespans on top of the minimum (s)
+      // ── motion: one shared laminar current + small per-particle wander ──
+      currentStr:    0.03,  // laminar current strength (the dominant, shared drift)
+      currentAngle:  2.56,  // current base direction (radians, 0..2π)
+      currentWobble: 0.12,  // how far the current angle swings over time (aliveness)
+      wobbleSpeed:   2.0,   // how fast that angle swing happens
+      laneFreq:    0.006, // lane density — how many laminae span the stream
+      laneAmp:     0.28,  // lane contrast — how differently adjacent laminae move (0 = one rigid sheet)
+      meander:     70.0,  // how far the laminae wander side-to-side (px) — waves, not straight bands
+      meanderFreq: 0.012, // meander scale — long wavelength = lazy S-curves, short = wrinkly
+      flowStr:    0.06,   // personal wander strength (curl noise — keep well below currentStr)
+      flowSpeed:  1.50,   // how fast each particle's wander evolves
+      damping:    0.908,  // velocity retention (higher = floatier, more movement)
+      jitter:     0.08,   // shimmer
+      trail:      0.958,  // trail persistence (higher = longer trails)
       handSmooth: 0.23,   // hand jitter smoothing (lower = smoother, laggier)
       repelRad:   0.12,   // repulsion radius (× hand span)
       repelStr:   0.31    // repulsion push strength
     };
-    const STORE_KEY = 'biolum-params-v1';
+    const STORE_KEY = 'biolum-params-v5';
     const params = Object.assign({}, DEFAULTS);
     try { Object.assign(params, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {}
     const saveParams = () => { try { localStorage.setItem(STORE_KEY, JSON.stringify(params)); } catch (e) {} };
 
-    // ── Hand appearance/shape — live-tunable, persisted separately ──
+    // ── Hand appearance/shape — finalized (panel removed; these are the baked values) ──
     const HAND_DEFAULTS = {
       fingerThick: 1.09,  // finger/thumb thickness multiplier
       baseMul:     0.99,  // knuckle-end thickness multiplier
@@ -114,17 +137,14 @@
       blend:       0.09,  // finger↔palm smooth-union (0 = crisp, higher = webbed)
       palmRound:   0.135, // palm size / roundness (× hand span)
       edgeSoft:    2.00,  // outline softness multiplier
-      fill:        0.66,  // body opacity
-      rim:         2.00,  // edge-glow strength
+      fill:        0.87,  // body opacity
+      rim:         2.76,  // edge-glow strength
       halo:        0.29,  // soft outer halo strength
       hue:         0.56,  // colour hue (0..1)
-      sat:         0.60,  // saturation
-      light:       0.16   // lightness
+      sat:         0.72,  // saturation
+      light:       0.27   // lightness
     };
-    const HAND_STORE_KEY = 'biolum-hand-v1';
     const handParams = Object.assign({}, HAND_DEFAULTS);
-    try { Object.assign(handParams, JSON.parse(localStorage.getItem(HAND_STORE_KEY) || '{}')); } catch (e) {}
-    const saveHandParams = () => { try { localStorage.setItem(HAND_STORE_KEY, JSON.stringify(handParams)); } catch (e) {} };
 
     // ══════════════════════════════════════════════
     // RENDERER + CAMERA
@@ -312,6 +332,7 @@
     const posFrag = `
       uniform float uTime, uDt, uW, uH, uFlowStr, uFlowScale, uFlowSpeed, uRadBase;
       uniform float uDamping, uJitter, uRepelRad, uRepelStr;
+      uniform float uCurrentStr, uCurrentAngle, uCurrentWobble, uWobbleSpeed, uLaneFreq, uLaneAmp, uMeander, uMeanderFreq;
       uniform float uHandThick, uHandPalm, uHandBlend, uHandBaseMul, uHandTipMul;
       uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
       uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
@@ -342,10 +363,27 @@
 
         vec2 pos = P.xy; vec2 vel = P.zw;
 
-        // gentle ocean drift (curl noise)
+        // personal slow wander (curl noise — kept low; this is each particle's drift)
         float t = uTime*uFlowSpeed;
         float fx = curlX(pos.x, pos.y, t, uFlowScale)*uFlowStr;
         float fy = curlY(pos.x, pos.y, t, uFlowScale)*uFlowStr;
+
+        // shared laminar current — flows one direction, but split into parallel
+        // laminae: speed varies across the stream so adjacent layers shear past each
+        // other (a real velocity profile, not one rigid sheet). Angle breathes slowly.
+        float cang = uCurrentAngle + uCurrentWobble*(sin(uTime*0.07*uWobbleSpeed) + 0.5*sin(uTime*0.017*uWobbleSpeed));
+        vec2 dir  = vec2(cos(cang), sin(cang));
+        vec2 perp = vec2(-dir.y, dir.x);
+        float along = dot(pos, dir);                        // distance along the stream
+        float lane  = dot(pos, perp);                       // distance across the stream
+        // waves, not a straight comb: meander the laminae side-to-side, and let the
+        // cross term bunch them into thick/thin bands as they run downstream
+        lane += uMeander * (sin(along*uMeanderFreq + uTime*0.04)
+                          + 0.6*sin(lane*uLaneFreq*0.5 - along*uMeanderFreq*1.7 + uTime*0.03));
+        float prof = sin(lane*uLaneFreq + uTime*0.05)
+                   + 0.5*sin(lane*uLaneFreq*2.3 - uTime*0.03);
+        float speed = uCurrentStr * (1.0 + uLaneAmp*prof);  // each lamina its own speed
+        vec2 current = dir * speed;
 
         float seed = hash12(uv)*1000.0;
         float radNoise = 0.7 + 0.6*(sin(seed*3.7 + uTime*2.0)*0.5+0.5);
@@ -364,7 +402,7 @@
         float jx = (hash11(jb+0.7)-0.5)*uJitter;
         float jy = (hash11(jb+9.1)-0.5)*uJitter;
 
-        vel += (vec2(fx,fy) + repel + vec2(jx,jy)) * uDt * 60.0;
+        vel += (current + vec2(fx,fy) + repel + vec2(jx,jy)) * uDt * 60.0;
         vel *= uDamping;
         pos += vel;
 
@@ -381,7 +419,7 @@
 
     // ── Age / excitation / hue step ──
     const dataFrag = `
-      uniform float uTime, uDt, uRadBase, uRepelRad;
+      uniform float uTime, uDt, uRadBase, uRepelRad, uLifeMin, uLifeRange;
       uniform float uHandThick, uHandPalm, uHandBlend, uHandBaseMul, uHandTipMul;
       uniform vec2 uHand0Pts[21]; uniform float uHand0Scale, uHand0On; uniform vec4 uHand0Box;
       uniform vec2 uHand1Pts[21]; uniform float uHand1Scale, uHand1On; uniform vec4 uHand1Box;
@@ -401,7 +439,7 @@
 
         // respawn — new lifespan + fresh color
         if (age + uDt >= maxAge){
-          float newMax = 6.0 + hash11(sb+5.5)*14.0;
+          float newMax = uLifeMin + hash11(sb+5.5)*uLifeRange;
           float roll = hash11(sb+6.6);
           float hb = hash11(sb+7.7);
           float nh;
@@ -447,6 +485,10 @@
       uW: { value: W }, uH: { value: H },
       uFlowStr: { value: params.flowStr }, uFlowScale: { value: FLOW_SCALE },
       uFlowSpeed: { value: params.flowSpeed }, uRadBase: { value: 60 },
+      uCurrentStr: { value: params.currentStr }, uCurrentAngle: { value: params.currentAngle }, uCurrentWobble: { value: params.currentWobble },
+      uWobbleSpeed: { value: params.wobbleSpeed },
+      uLaneFreq: { value: params.laneFreq }, uLaneAmp: { value: params.laneAmp },
+      uMeander: { value: params.meander }, uMeanderFreq: { value: params.meanderFreq },
       uDamping: { value: params.damping }, uJitter: { value: params.jitter },
       uRepelRad: { value: params.repelRad }, uRepelStr: { value: params.repelStr },
       uHandThick: { value: handParams.fingerThick }, uHandPalm: { value: handParams.palmRound },
@@ -456,6 +498,7 @@
     Object.assign(dataVar.material.uniforms, {
       uTime: { value: 0 }, uDt: { value: 0.016 },
       uRadBase: { value: 60 }, uRepelRad: { value: params.repelRad },
+      uLifeMin: { value: params.lifeMin }, uLifeRange: { value: params.lifeRange },
       uHandThick: { value: handParams.fingerThick }, uHandPalm: { value: handParams.palmRound },
       uHandBlend: { value: handParams.blend }, uHandBaseMul: { value: handParams.baseMul }, uHandTipMul: { value: handParams.tipMul },
       ...handUniforms()
@@ -483,12 +526,16 @@
         uTime: { value: 0 },
         uBaseGlow: { value: params.baseGlow },
         uExcGlow: { value: params.excGlow },
-        uAlpha: { value: params.alpha }
+        uAlpha: { value: params.alpha },
+        uHueShift: { value: params.hueShift },
+        uSat: { value: params.sat },
+        uPointSize: { value: params.pointSize },
+        uSizeGlow: { value: params.sizeGlow }
       },
       vertexShader: `
         uniform sampler2D texPos;
         uniform sampler2D texData;
-        uniform float uTime, uBaseGlow, uExcGlow, uAlpha;
+        uniform float uTime, uBaseGlow, uExcGlow, uAlpha, uPointSize, uSizeGlow;
         attribute vec2 reference;
         varying float vAlpha;
         varying float vHue;
@@ -507,11 +554,12 @@
           float life = ageFade * (breath + exc*uExcGlow);
           vAlpha = life * uAlpha;
           vHue = hue;
-          gl_PointSize = 3.4 + life * 2.6; // brighter = bigger glow
+          gl_PointSize = uPointSize + life * uSizeGlow; // brighter = bigger glow
           gl_Position = projectionMatrix * modelViewMatrix * vec4(P.xy, 0.0, 1.);
         }
       `,
       fragmentShader: `
+        uniform float uHueShift, uSat;
         varying float vAlpha;
         varying float vHue;
         vec3 hue2rgb(float h) {
@@ -525,8 +573,11 @@
           float d = length(gl_PointCoord - .5) * 2.;
           if (d > 1.) discard;
           float a = (1.-d*d) * vAlpha;
-          float h = vHue;
+          float h = vHue + uHueShift;
           vec3 c = hue2rgb(h);
+          // saturation: pull toward luma when desaturated
+          float luma = dot(c, vec3(0.299, 0.587, 0.114));
+          c = mix(vec3(luma), c, uSat);
           // when excited, push toward bright white-cyan
           c = mix(c, vec3(.6, .95, .9), vAlpha * 0.4);
           gl_FragColor = vec4(c, a);
@@ -750,12 +801,21 @@
     function applyParams() {
       const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
       pu.uFlowStr.value = params.flowStr;   pu.uFlowSpeed.value = params.flowSpeed;
+      pu.uCurrentStr.value = params.currentStr; pu.uCurrentAngle.value = params.currentAngle; pu.uCurrentWobble.value = params.currentWobble;
+      pu.uWobbleSpeed.value = params.wobbleSpeed;
+      pu.uLaneFreq.value = params.laneFreq; pu.uLaneAmp.value = params.laneAmp;
+      pu.uMeander.value = params.meander; pu.uMeanderFreq.value = params.meanderFreq;
       pu.uDamping.value = params.damping;   pu.uJitter.value = params.jitter;
       pu.uRepelRad.value = params.repelRad; pu.uRepelStr.value = params.repelStr;
       du.uRepelRad.value = params.repelRad;
+      du.uLifeMin.value = params.lifeMin; du.uLifeRange.value = params.lifeRange;
       pMat.uniforms.uBaseGlow.value = params.baseGlow;
       pMat.uniforms.uExcGlow.value = params.excGlow;
       pMat.uniforms.uAlpha.value = params.alpha;
+      pMat.uniforms.uHueShift.value = params.hueShift;
+      pMat.uniforms.uSat.value = params.sat;
+      pMat.uniforms.uPointSize.value = params.pointSize;
+      pMat.uniforms.uSizeGlow.value = params.sizeGlow;
     }
 
     // Push live hand appearance/shape params into all relevant uniforms.
@@ -876,19 +936,32 @@
     // ══════════════════════════════════════════════
     // CONTROL PANEL (live tuning, persisted to localStorage)
     // ══════════════════════════════════════════════
-    const HAND_CONTROLS = [
-      { key: 'fingerThick', label: 'Finger thickness',  min: 0.4,  max: 2.0,  step: 0.01  },
-      { key: 'baseMul',     label: 'Knuckle thickness', min: 0.4,  max: 1.8,  step: 0.01  },
-      { key: 'tipMul',      label: 'Fingertip thickness',min: 0.2, max: 1.6,  step: 0.01  },
-      { key: 'blend',       label: 'Finger–palm blend', min: 0,    max: 0.5,  step: 0.005 },
-      { key: 'palmRound',   label: 'Palm size',         min: 0.05, max: 0.40, step: 0.005 },
-      { key: 'edgeSoft',    label: 'Edge softness',     min: 0.2,  max: 4,    step: 0.05  },
-      { key: 'fill',        label: 'Fill opacity',     min: 0,    max: 1.2,  step: 0.01  },
-      { key: 'rim',         label: 'Rim glow',         min: 0,    max: 3,    step: 0.02  },
-      { key: 'halo',        label: 'Outer halo',       min: 0,    max: 0.6,  step: 0.01  },
-      { key: 'hue',         label: 'Hue',              min: 0,    max: 1,    step: 0.005 },
-      { key: 'sat',         label: 'Saturation',       min: 0,    max: 1,    step: 0.01  },
-      { key: 'light',       label: 'Lightness',        min: 0,    max: 1,    step: 0.01  }
+    const PARTICLE_CONTROLS = [
+      { key: 'hueShift',  label: 'Hue shift',      min: 0,    max: 1,    step: 0.005 },
+      { key: 'sat',       label: 'Saturation',     min: 0,    max: 1,    step: 0.01  },
+      { key: 'baseGlow',  label: 'Base glow',      min: 0,    max: 0.6,  step: 0.005 },
+      { key: 'excGlow',   label: 'Excited glow',   min: 0,    max: 1.5,  step: 0.01  },
+      { key: 'alpha',     label: 'Opacity',        min: 0,    max: 3,    step: 0.02  },
+      { key: 'pointSize', label: 'Particle size',  min: 1,    max: 12,   step: 0.1   },
+      { key: 'sizeGlow',  label: 'Glow size',      min: 0,    max: 8,    step: 0.1   },
+      { key: 'lifeMin',   label: 'Min lifespan',   min: 1,    max: 20,   step: 0.5   },
+      { key: 'lifeRange', label: 'Lifespan range', min: 0,    max: 30,   step: 0.5   },
+      { key: 'trail',     label: 'Trail length',   min: 0.80, max: 0.99, step: 0.002 }
+    ];
+
+    const FLOW_CONTROLS = [
+      { key: 'currentStr',    label: 'Current strength', min: 0,    max: 0.40, step: 0.005 },
+      { key: 'currentAngle',  label: 'Current angle',    min: 0,    max: 6.28, step: 0.01  },
+      { key: 'currentWobble', label: 'Current wobble',   min: 0,    max: 1.0,  step: 0.01   },
+      { key: 'wobbleSpeed',   label: 'Wobble speed',     min: 0,    max: 2.0,  step: 0.01   },
+      { key: 'laneFreq',      label: 'Lane count',       min: 0,    max: 0.05, step: 0.001  },
+      { key: 'laneAmp',       label: 'Lane contrast',    min: 0,    max: 1.5,  step: 0.02   },
+      { key: 'meander',       label: 'Wave meander',     min: 0,    max: 300,  step: 2      },
+      { key: 'meanderFreq',   label: 'Meander scale',    min: 0.0005,max: 0.02,step: 0.0005 },
+      { key: 'flowStr',       label: 'Personal wander',  min: 0,    max: 0.30, step: 0.005  },
+      { key: 'flowSpeed',     label: 'Wander speed',     min: 0.1,  max: 3.0,  step: 0.05  },
+      { key: 'damping',       label: 'Floatiness',       min: 0.80, max: 0.99, step: 0.002 },
+      { key: 'jitter',        label: 'Shimmer',          min: 0,    max: 1.0,  step: 0.02  }
     ];
 
     // generic slider panel bound to a params object (auto-saves on change)
@@ -922,10 +995,11 @@
         panel.appendChild(row);
       }
 
-      const foot = document.createElement('div'); foot.id = 'panel-foot';
+      const foot = document.createElement('div'); foot.className = 'panel-foot';
       const reset = document.createElement('button'); reset.textContent = 'reset';
       reset.addEventListener('click', () => {
-        Object.assign(obj, defaults); save();
+        for (const c of controls) obj[c.key] = defaults[c.key]; // only this panel's keys
+        save();
         for (const c of controls) {
           sliders[c.key].inp.value = obj[c.key];
           sliders[c.key].val.textContent = fmt(obj[c.key], c.step);
@@ -939,7 +1013,8 @@
       foot.appendChild(reset); foot.appendChild(copy);
       panel.appendChild(foot);
     }
-    buildPanel(document.getElementById('panel'), '✦ hand', HAND_CONTROLS, handParams, HAND_DEFAULTS, saveHandParams);
+    buildPanel(document.getElementById('panel'), '✦ flow', FLOW_CONTROLS, params, DEFAULTS, saveParams);
+    buildPanel(document.getElementById('panel2'), '✦ particles', PARTICLE_CONTROLS, params, DEFAULTS, saveParams);
 
     animate();
   </script>
