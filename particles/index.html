@@ -14,12 +14,6 @@
       transition: color 0.2s;
     }
     #back:hover { color: rgba(255,255,255,0.8); }
-    #phase-label {
-      position: fixed; bottom: 24px; right: 24px;
-      font: 11px monospace; letter-spacing: 1px;
-      color: rgba(255,255,255,0.12);
-      pointer-events: none; z-index: 10;
-    }
     #panels {
       position: fixed; top: 16px; right: 16px; z-index: 20;
       display: flex; flex-direction: column; gap: 10px; align-items: flex-end;
@@ -51,7 +45,6 @@
 </head>
 <body>
   <a id="back" href="../">&larr; back</a>
-  <div id="phase-label"></div>
   <div id="panels">
     <div id="panel" class="panel"></div>
     <div id="panel2" class="panel"></div>
@@ -81,8 +74,7 @@
     // uniforms + the interactor positions each frame — no per-particle loop.
     const TEX_SIZE = 158;                       // 158² = 24964 particles (~25k)
     const PARTICLE_COUNT = TEX_SIZE * TEX_SIZE;
-    const MAX_POINTS = 130;                      // interactor texture width (hands ~74, mouse 1)
-    const PHASE_DURATION = 20;
+    const MOUSE_RAD = 80;                        // mouse-fallback interaction radius (px)
     const W = window.innerWidth, H = window.innerHeight;
 
     // ── Device tier (cheap heuristic; Tier 3 refines this with an FPS probe) ──
@@ -594,8 +586,6 @@
     // ══════════════════════════════════════════════
     // INTERACTION POINTS (hands + mouse fallback)
     // ══════════════════════════════════════════════
-    // Each point: {x, y} in scene coords (centered, y-up)
-    let interactors = [];
     let hasHands = false;
 
     // ── Mouse fallback ──
@@ -614,8 +604,6 @@
     let videoReady = false;
     let lastDetect = 0;
     const videoEl = document.getElementById('video');
-
-    const PALM_VERTS = [0, 1, 5, 9, 13, 17];
 
     // ── Solid glowing hand: render the silhouette SDF as a filled glow ──
     const handFrag = `
@@ -745,10 +733,6 @@
       }
     }
 
-    function lm2scene(lm) {
-      return { x: (1 - lm.x) * W - W/2, y: -(lm.y * H - H/2) };
-    }
-
     async function startHands() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -848,9 +832,6 @@
     // ANIMATE
     // ══════════════════════════════════════════════
     let time = 0;
-    const totalCycle = PHASE_DURATION * 3;
-    const phaseEl = document.getElementById('phase-label');
-    const NAMES = ['reveal', 'disturb', 'draw'];
     let hintVisible = true;
     let idleTime = 0;
     const hintEl = document.getElementById('hint');
@@ -863,18 +844,13 @@
       detectHands();
       updateHands();   // smooth hand toward latest detection (kills MediaPipe jitter)
 
-      const phase = Math.min((time % totalCycle) / PHASE_DURATION, 2.999);
-      phaseEl.textContent = NAMES[Math.floor(phase)];
-
-      const disturb = 1 - Math.abs(phase - 1);
-      const mouseRadBase = 60 + disturb * 40;
       // breathing: trail persistence oscillates → whole field gently pulses
       fadeMat.uniforms.fade.value = params.trail + 0.012 * Math.sin(time * 0.3);
 
       // ── Feed sim params + hand/mouse interaction state to the GPU ──
       const pu = posVar.material.uniforms, du = dataVar.material.uniforms;
-      pu.uTime.value = time; pu.uDt.value = dt; pu.uRadBase.value = mouseRadBase;
-      du.uTime.value = time; du.uDt.value = dt; du.uRadBase.value = mouseRadBase;
+      pu.uTime.value = time; pu.uDt.value = dt; pu.uRadBase.value = MOUSE_RAD;
+      du.uTime.value = time; du.uDt.value = dt; du.uRadBase.value = MOUSE_RAD;
       applyParams();
       applyHandParams();
       setHandUniforms(pu);
