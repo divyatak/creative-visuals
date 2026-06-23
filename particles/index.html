@@ -114,14 +114,26 @@
       repelRad:   0.12,   // repulsion radius (× hand span)
       repelStr:   0.31    // repulsion push strength
     };
-    // Tuning mode: append `?tune` to the URL to summon live control panels that
-    // auto-save every change to localStorage. Production (no ?tune) ignores any
-    // saved values and always runs the baked DEFAULTS above.
-    const TUNING = new URLSearchParams(location.search).has('tune');
+    // Tuning mode: append `?tune` to the URL ON LOCALHOST ONLY to summon live
+    // control panels. Locked to localhost so the deployed site can never expose
+    // the tuner. Production ignores any saved values and runs the baked DEFAULTS.
+    const IS_LOCAL = ['localhost', '127.0.0.1', '::1', ''].includes(location.hostname);
+    const TUNING = IS_LOCAL && new URLSearchParams(location.search).has('tune');
     const STORE_KEY = 'biolum-params-v6';
     const params = Object.assign({}, DEFAULTS);
     if (TUNING) { try { Object.assign(params, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {} }
-    const saveParams = () => { try { localStorage.setItem(STORE_KEY, JSON.stringify(params)); } catch (e) {} };
+    // Persist every edit: localStorage (survives refresh) + a debounced POST to
+    // the dev tune-server, which writes particles/.tunestate.json so the values
+    // can be baked into DEFAULTS with no copy-paste. The POST fails silently when
+    // served by a plain static server (npx serve) — localStorage still works.
+    let _tunePostTimer = 0;
+    const saveParams = () => {
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(params)); } catch (e) {}
+      clearTimeout(_tunePostTimer);
+      _tunePostTimer = setTimeout(() => {
+        fetch('/__tune', { method: 'POST', body: JSON.stringify(params, null, 2) }).catch(() => {});
+      }, 400);
+    };
 
     // ── Hand appearance/shape — finalized (panel removed; these are the baked values) ──
     const HAND_DEFAULTS = {
