@@ -68,20 +68,21 @@
       lifeMin:    1.5,    // shortest lifespan (s) — lower = faster regen
       lifeRange:  30.0,   // spread of lifespans on top of the minimum (s)
       // ── motion: one shared laminar current + small per-particle wander ──
-      currentStr:    0.03,  // laminar current strength (the dominant, shared drift)
-      currentAngle:  2.56,  // current base direction (radians, 0..2π)
+      currentStr:    0.025, // laminar current strength (the dominant, shared drift)
+      currentAngle:  1.94,  // current base direction (radians, 0..2π)
       currentWobble: 0.12,  // how far the current angle swings over time (aliveness)
       wobbleSpeed:   2.0,   // how fast that angle swing happens
-      laneFreq:    0.006, // lane density — how many laminae span the stream
-      laneAmp:     0.28,  // lane contrast — how differently adjacent laminae move (0 = one rigid sheet)
-      meander:     70.0,  // how far the laminae wander side-to-side (px) — waves, not straight bands
-      meanderFreq: 0.012, // meander scale — long wavelength = lazy S-curves, short = wrinkly
+      laneFreq:    0.005, // lane density — how many laminae span the stream
+      laneAmp:     0.36,  // lane contrast — how differently adjacent laminae move (0 = one rigid sheet)
+      meander:     300.0, // how far the laminae wander side-to-side (px) — waves, not straight bands
+      meanderFreq: 0.008, // meander scale — long wavelength = lazy S-curves, short = wrinkly
       flowStr:    0.06,   // personal wander strength (curl noise — keep well below currentStr)
-      flowSpeed:  1.50,   // how fast each particle's wander evolves
+      flowSpeed:  1.30,   // how fast each particle's wander evolves
       damping:    0.908,  // velocity retention (higher = floatier, more movement)
       jitter:     0.08,   // shimmer
       trail:      0.958,  // trail persistence (higher = longer trails)
-      handSmooth: 0.23,   // hand jitter smoothing (lower = smoother, laggier)
+      handSmooth: 0.10,   // hand jitter smoothing (lower = smoother, laggier)
+      detectMs:   60,     // ms between MediaPipe detections (lower = fresher targets, heavier)
       repelRad:   0.12,   // repulsion radius (× hand span)
       repelStr:   0.31    // repulsion push strength
     };
@@ -732,7 +733,7 @@
     function detectHands() {
       if (!handLandmarker || !videoReady) return;
       const now = performance.now();
-      if (now - lastDetect < 80) return;
+      if (now - lastDetect < params.detectMs) return;
       lastDetect = now;
 
       let results;
