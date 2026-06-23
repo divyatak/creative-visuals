@@ -14,6 +14,34 @@
       transition: color 0.2s;
     }
     #back:hover { color: rgba(255,255,255,0.8); }
+    /* ── tuning panels (only injected when the URL has ?tune) ── */
+    #panels {
+      position: fixed; top: 16px; right: 16px; z-index: 20;
+      display: flex; flex-direction: column; gap: 10px; align-items: flex-end;
+      max-height: 92vh; overflow-y: auto;
+    }
+    .panel {
+      width: 232px;
+      background: rgba(8,16,20,0.72); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+      border: 1px solid rgba(120,200,220,0.18); border-radius: 10px;
+      padding: 10px 12px; font: 11px monospace; color: rgba(200,235,245,0.85);
+      cursor: auto; user-select: none;
+    }
+    .panel.collapsed .row, .panel.collapsed .panel-foot { display: none; }
+    .panel h3 {
+      font-size: 11px; letter-spacing: 1px; font-weight: normal; margin: 0 0 6px;
+      color: rgba(160,220,235,0.7); display: flex; justify-content: space-between; cursor: pointer;
+    }
+    .panel .row { margin: 7px 0; }
+    .panel .row label { display: flex; justify-content: space-between; margin-bottom: 2px; color: rgba(190,225,235,0.65); }
+    .panel .row label span { color: rgba(150,235,210,0.95); }
+    .panel input[type=range] { width: 100%; height: 14px; accent-color: #5fd8c8; cursor: pointer; }
+    .panel-foot { margin-top: 10px; display: flex; gap: 8px; }
+    .panel-foot button {
+      flex: 1; background: rgba(95,216,200,0.12); color: rgba(180,235,225,0.9);
+      border: 1px solid rgba(120,200,220,0.25); border-radius: 6px; padding: 5px; font: 10px monospace; cursor: pointer;
+    }
+    .panel-foot button:hover { background: rgba(95,216,200,0.22); }
   </style>
 </head>
 <body>
@@ -86,7 +114,14 @@
       repelRad:   0.12,   // repulsion radius (× hand span)
       repelStr:   0.31    // repulsion push strength
     };
+    // Tuning mode: append `?tune` to the URL to summon live control panels that
+    // auto-save every change to localStorage. Production (no ?tune) ignores any
+    // saved values and always runs the baked DEFAULTS above.
+    const TUNING = new URLSearchParams(location.search).has('tune');
+    const STORE_KEY = 'biolum-params-v6';
     const params = Object.assign({}, DEFAULTS);
+    if (TUNING) { try { Object.assign(params, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {} }
+    const saveParams = () => { try { localStorage.setItem(STORE_KEY, JSON.stringify(params)); } catch (e) {} };
 
     // ── Hand appearance/shape — finalized (panel removed; these are the baked values) ──
     const HAND_DEFAULTS = {
@@ -875,6 +910,117 @@
       trailCam.top = h/2; trailCam.bottom = -h/2;
       trailCam.updateProjectionMatrix();
     });
+
+    // ══════════════════════════════════════════════
+    // TUNING PANELS  (only when the URL contains ?tune)
+    // ══════════════════════════════════════════════
+    // Live sliders bound to `params`; every change auto-saves to localStorage so
+    // the session survives refreshes. applyParams()/applyHandParams() already push
+    // `params` to the GPU each frame, so edits take effect immediately.
+    const PARTICLE_CONTROLS = [
+      { key: 'hueShift',  label: 'Hue shift',      min: 0,    max: 1,    step: 0.005 },
+      { key: 'sat',       label: 'Saturation',     min: 0,    max: 1,    step: 0.01  },
+      { key: 'baseGlow',  label: 'Base glow',      min: 0,    max: 0.6,  step: 0.005 },
+      { key: 'excGlow',   label: 'Excited glow',   min: 0,    max: 1.5,  step: 0.01  },
+      { key: 'alpha',     label: 'Opacity',        min: 0,    max: 3,    step: 0.02  },
+      { key: 'pointSize', label: 'Particle size',  min: 1,    max: 12,   step: 0.1   },
+      { key: 'sizeGlow',  label: 'Glow size',      min: 0,    max: 8,    step: 0.1   },
+      { key: 'lifeMin',   label: 'Min lifespan',   min: 1,    max: 20,   step: 0.5   },
+      { key: 'lifeRange', label: 'Lifespan range', min: 0,    max: 30,   step: 0.5   },
+      { key: 'trail',     label: 'Trail length',   min: 0.80, max: 0.99, step: 0.002 }
+    ];
+
+    const FLOW_CONTROLS = [
+      { key: 'handSmooth',    label: 'Hand smoothing',   min: 0.05, max: 1.0,  step: 0.01   },
+      { key: 'detectMs',      label: 'Detect rate (ms)', min: 30,   max: 150,  step: 5      },
+      { key: 'currentStr',    label: 'Current strength', min: 0,    max: 0.40, step: 0.005  },
+      { key: 'currentAngle',  label: 'Current angle',    min: 0,    max: 6.28, step: 0.01   },
+      { key: 'currentWobble', label: 'Current wobble',   min: 0,    max: 1.0,  step: 0.01   },
+      { key: 'wobbleSpeed',   label: 'Wobble speed',     min: 0,    max: 2.0,  step: 0.01   },
+      { key: 'laneFreq',      label: 'Lane count',       min: 0,    max: 0.05, step: 0.001  },
+      { key: 'laneAmp',       label: 'Lane contrast',    min: 0,    max: 1.5,  step: 0.02   },
+      { key: 'meander',       label: 'Wave meander',     min: 0,    max: 300,  step: 2      },
+      { key: 'meanderFreq',   label: 'Meander scale',    min: 0.0005,max: 0.02,step: 0.0005 },
+      { key: 'flowStr',       label: 'Personal wander',  min: 0,    max: 0.30, step: 0.005  },
+      { key: 'flowSpeed',     label: 'Wander speed',     min: 0.1,  max: 3.0,  step: 0.05   },
+      { key: 'damping',       label: 'Floatiness',       min: 0.80, max: 0.99, step: 0.002  },
+      { key: 'jitter',        label: 'Shimmer',          min: 0,    max: 1.0,  step: 0.02   }
+    ];
+
+    // robust clipboard: Clipboard API needs a secure context (fails on plain
+    // http://localhost), so fall back to a hidden textarea + execCommand.
+    async function copyText(text, btn) {
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+      if (!ok) {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        try { ok = document.execCommand('copy'); } catch (e) {}
+        ta.remove();
+      }
+      const orig = 'copy values';
+      btn.textContent = ok ? 'copied!' : 'copy failed — see console';
+      if (!ok) console.log(text);
+      setTimeout(() => { btn.textContent = orig; }, 1400);
+    }
+
+    function buildPanel(panel, title, controls) {
+      const fmt = (v, step) => (+v).toFixed(step < 0.01 ? 3 : 2);
+      const sliders = {};
+
+      const head = document.createElement('h3');
+      head.innerHTML = `<span>${title}</span><span class="panel-tog">[hide]</span>`;
+      const tog = head.querySelector('.panel-tog');
+      head.addEventListener('click', () => {
+        panel.classList.toggle('collapsed');
+        tog.textContent = panel.classList.contains('collapsed') ? '[show]' : '[hide]';
+      });
+      panel.appendChild(head);
+
+      for (const c of controls) {
+        const row = document.createElement('div'); row.className = 'row';
+        const lab = document.createElement('label');
+        const val = document.createElement('span'); val.textContent = fmt(params[c.key], c.step);
+        lab.appendChild(document.createTextNode(c.label)); lab.appendChild(val);
+        const inp = document.createElement('input');
+        inp.type = 'range'; inp.min = c.min; inp.max = c.max; inp.step = c.step; inp.value = params[c.key];
+        inp.addEventListener('input', () => {
+          params[c.key] = parseFloat(inp.value);
+          val.textContent = fmt(params[c.key], c.step);
+          saveParams();                       // auto-save every change
+        });
+        sliders[c.key] = { inp, val, step: c.step };
+        row.appendChild(lab); row.appendChild(inp);
+        panel.appendChild(row);
+      }
+
+      const foot = document.createElement('div'); foot.className = 'panel-foot';
+      const reset = document.createElement('button'); reset.textContent = 'reset';
+      reset.addEventListener('click', () => {
+        for (const c of controls) params[c.key] = DEFAULTS[c.key]; // only this panel's keys
+        saveParams();
+        for (const c of controls) {
+          sliders[c.key].inp.value = params[c.key];
+          sliders[c.key].val.textContent = fmt(params[c.key], c.step);
+        }
+      });
+      const copy = document.createElement('button'); copy.textContent = 'copy values';
+      copy.addEventListener('click', () => copyText(JSON.stringify(params, null, 2), copy));
+      foot.appendChild(reset); foot.appendChild(copy);
+      panel.appendChild(foot);
+    }
+
+    if (TUNING) {
+      const wrap = document.createElement('div'); wrap.id = 'panels';
+      const p1 = document.createElement('div'); p1.className = 'panel';
+      const p2 = document.createElement('div'); p2.className = 'panel';
+      wrap.appendChild(p1); wrap.appendChild(p2);
+      document.body.appendChild(wrap);
+      buildPanel(p1, '✦ flow', FLOW_CONTROLS);
+      buildPanel(p2, '✦ particles', PARTICLE_CONTROLS);
+      console.log('[biolum] tuning mode — edits auto-save to localStorage; "copy values" exports the full set');
+    }
 
     animate();
   </script>
