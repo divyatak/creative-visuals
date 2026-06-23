@@ -3,16 +3,17 @@
 //   node tune-server.cjs        → serves the site on http://localhost:3000
 //
 // Open http://localhost:3000/particles/?tune and drag the sliders. The biolum
-// tuner POSTs its params to /__tune on every change; we persist them to
-// particles/.tunestate.json (gitignored) so the values can be baked straight
-// into DEFAULTS — no copy-paste. Use this instead of `npx serve` when tuning.
+// tuner POSTs its params to /__tune on every change; we write them straight to
+// particles/defaults.json — the file the page loads as its source of truth. So
+// tuned values are "saved" instantly; commit + push that file to ship them live.
+// Use this instead of `npx serve` when tuning.
 const http = require('http');
 const fs   = require('fs');
 const path = require('path');
 
 const ROOT = __dirname;
 const PORT = process.env.PORT || 3000;
-const STATE_FILE = path.join(ROOT, 'particles', '.tunestate.json');
+const STATE_FILE = path.join(ROOT, 'particles', 'defaults.json');
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',

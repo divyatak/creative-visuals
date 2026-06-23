@@ -119,16 +119,16 @@
     // the tuner. Production ignores any saved values and runs the baked DEFAULTS.
     const IS_LOCAL = ['localhost', '127.0.0.1', '::1', ''].includes(location.hostname);
     const TUNING = IS_LOCAL && new URLSearchParams(location.search).has('tune');
-    const STORE_KEY = 'biolum-params-v6';
+    // defaults.json is the live source of truth — it overrides the built-in
+    // fallback above for everyone. The ?tune panels write straight back to it
+    // (via tune-server), so a tuned value is "saved" the moment you drag it, and
+    // goes live whenever the file is committed. No copy-paste, no hand-baking.
     const params = Object.assign({}, DEFAULTS);
-    if (TUNING) { try { Object.assign(params, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {} }
-    // Persist every edit: localStorage (survives refresh) + a debounced POST to
-    // the dev tune-server, which writes particles/.tunestate.json so the values
-    // can be baked into DEFAULTS with no copy-paste. The POST fails silently when
-    // served by a plain static server (npx serve) — localStorage still works.
+    try { Object.assign(params, await (await fetch('./defaults.json', { cache: 'no-store' })).json()); } catch (e) {}
+    // Persist edits straight to defaults.json (debounced) through the dev server.
+    // Fails silently under a plain static server (npx serve), which is fine.
     let _tunePostTimer = 0;
     const saveParams = () => {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify(params)); } catch (e) {}
       clearTimeout(_tunePostTimer);
       _tunePostTimer = setTimeout(() => {
         fetch('/__tune', { method: 'POST', body: JSON.stringify(params, null, 2) }).catch(() => {});
