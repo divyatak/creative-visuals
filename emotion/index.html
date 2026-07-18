@@ -31,12 +31,34 @@
     width: 22%; aspect-ratio: 3/4;
     object-fit: cover; transform: scaleX(-1);
     border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
-    background: #111; opacity: 0.9;
+    background: #111; opacity: 0;
     box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+    transition: opacity 1.2s ease;
   }
+  #cam.show { opacity: 0.9; }
+
+  /* Intro: "ready to enter a new world?" -> countdown -> soft fade-in */
+  #intro {
+    position: absolute; inset: 0; z-index: 5; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    background: #05060a; transition: opacity 1.4s ease;
+  }
+  #intro.gone { opacity: 0; pointer-events: none; }
+  #introPrompt {
+    font-size: 19px; letter-spacing: 0.2em; color: #cdd3e0; opacity: 0;
+    font-weight: 300; text-align: center; padding: 0 24px;
+  }
+  #intro.ready #introPrompt { animation: breathe 3.4s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { opacity: 0.4; } 50% { opacity: 0.85; } }
+  #count {
+    position: absolute; font-size: 76px; font-weight: 200; letter-spacing: 0.05em;
+    color: #e6ebf5; opacity: 0; text-shadow: 0 0 44px rgba(150,190,255,0.5);
+    transition: opacity 0.4s ease, transform 0.4s ease; transform: scale(0.9);
+  }
+  #count.show { opacity: 0.92; transform: scale(1); }
 
   /* Loading + completion overlay */
-  #veil { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  #veil { position: absolute; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center;
     background: #05060a; color: #cdd3e0; font-size: 13px; letter-spacing: 0.12em;
     transition: opacity 0.6s ease; }
   #veil.hidden { opacity: 0; pointer-events: none; }
@@ -50,6 +72,10 @@
     <canvas id="frame" width="720" height="1280"></canvas>
     <video id="cam" playsinline muted autoplay></video>
     <div id="debug"></div>
+    <div id="intro">
+      <div id="introPrompt">ready to enter a new world?</div>
+      <div id="count"></div>
+    </div>
     <div id="veil">loading…</div>
   </div>
 
@@ -74,6 +100,40 @@
     }
   ];
   const DEBUG = new URLSearchParams(location.search).has("debug");
+
+  // ---- Tunable params (source of truth = emotion/defaults.json, fetched at boot) ----
+  // Append ?tune ON LOCALHOST to summon the live curve editor; every edit auto-saves
+  // to defaults.json via tune-server. Deployed site just reads the baked file.
+  const IS_LOCAL = ["localhost", "127.0.0.1", "::1", ""].includes(location.hostname);
+  const TUNING = IS_LOCAL && new URLSearchParams(location.search).has("tune");
+  // response curve: cubic-bezier control points [x1,y1,x2,y2] mapping hand-spread -> bloom.
+  // diagonal handles = linear.
+  const DEFAULTS = { curve: [0.33, 0.33, 0.66, 0.66] };
+  const params = Object.assign({}, DEFAULTS);
+  let _tuneTimer = 0;
+  const saveParams = () => {
+    clearTimeout(_tuneTimer);
+    _tuneTimer = setTimeout(() => {
+      fetch("/__tune?to=emotion/defaults.json",
+        { method: "POST", body: JSON.stringify(params, null, 2) }).catch(() => {});
+    }, 400);
+  };
+
+  // Evaluate the response curve: given input x (0..1), solve the cubic-bezier for y.
+  function applyCurve(x) {
+    const [x1, y1, x2, y2] = params.curve;
+    const bx = (t) => { const u = 1 - t; return 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t; };
+    const by = (t) => { const u = 1 - t; return 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t; };
+    let t = x;
+    for (let i = 0; i < 8; i++) {
+      const dx = bx(t) - x;
+      if (Math.abs(dx) < 1e-4) break;
+      const d = 3 * (1 - t) * (1 - t) * x1 + 6 * (1 - t) * t * (x2 - x1) + 3 * t * t * (1 - x2);
+      if (Math.abs(d) < 1e-6) break;
+      t = Math.min(1, Math.max(0, t - dx / d));
+    }
+    return Math.min(1, Math.max(0, by(t)));
+  }
 
   const canvas = document.getElementById("frame");
   const ctx = canvas.getContext("2d");
@@ -192,16 +252,23 @@
     const target = idle ? smooth : rawSignal;
     smooth += (target - smooth) * 0.22;   // exponential smoothing
 
-    // gentle "breathing" so a still bud isn't dead: a few frames of slow drift,
-    // eased in only while no hand is present
+    // ease idle strength in/out (0 = hand driving, 1 = at rest)
     idleAmt += ((idle ? 1 : 0) - idleAmt) * 0.03;
-    const breath = idleAmt * (0.5 - 0.5 * Math.cos(now * 0.0011)) * 5.0;  // 0..5 frames
 
-    // map signal -> frame index (+ idle breath)
-    const s = st.invert ? (1 - smooth) : smooth;
-    const disp = s * (st.count - 1) + breath;
-    const idx = Math.min(st.count - 1, Math.max(0, Math.round(disp)));
+    // gesture -> response curve -> playhead position (in frames)
+    const shaped = applyCurve(smooth);
+    const s = st.invert ? (1 - shaped) : shaped;
+    let frameF = s * (st.count - 1);
+
+    // idle "breathing": gently scrub the real video across a span of frames so the bud
+    // stirs. wide enough span (IDLE_RANGE) that each step is tiny -> reads as motion, not stutter.
+    const IDLE_RANGE = 26;
+    frameF += idleAmt * (0.5 - 0.5 * Math.cos(now * 0.0014)) * IDLE_RANGE;
+
+    const idx = Math.min(st.count - 1, Math.max(0, Math.round(frameF)));
     drawFrame(idx);
+
+    if (TUNING) drawCurveEditor(smooth);   // live curve panel + input dot
 
     // TODO: station-complete detection + transition to next station goes here
 
@@ -215,13 +282,144 @@
     requestAnimationFrame(loop);
   }
 
+  // ---- Intro: ~2s "ready" -> 3·2·1 -> soft fade-in of the bud (fully automatic) ----
+  const intro = document.getElementById("intro");
+  const introPrompt = document.getElementById("introPrompt");
+  const countEl = document.getElementById("count");
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function countdown() {
+    for (const n of ["3", "2", "1"]) {
+      countEl.textContent = n;
+      countEl.classList.add("show");
+      await wait(720);
+      countEl.classList.remove("show");
+      await wait(300);
+    }
+  }
+
+  async function begin() {
+    // hide the prompt (inline styles override the .ready animation rule) before the numbers
+    introPrompt.style.animation = "none";
+    introPrompt.style.transition = "opacity 0.35s ease";
+    introPrompt.style.opacity = "0";
+    startCam();                    // kick off camera + hand tracking (permission prompt may appear)
+    await wait(450);
+    await countdown();
+    intro.classList.add("gone");   // soft 1.4s fade -> the bud breathes into view
+    await wait(500);
+    cam.classList.add("show");     // ease the corner self-view in last
+  }
+
+  // ---- Live curve editor (only mounted with ?tune on localhost) ----
+  let curveCtx = null;
+  const CM = 18, CS = 184;                                   // margin, draw size
+  const toPx = (x, y) => [CM + x * CS, CM + (1 - y) * CS];   // curve coords -> canvas px
+  function mountCurveEditor() {
+    const box = document.createElement("div");
+    box.style.cssText = "position:absolute;left:14px;top:14px;z-index:20;padding:12px;" +
+      "background:rgba(8,10,16,0.82);border:1px solid rgba(255,255,255,0.14);border-radius:10px;" +
+      "font:11px ui-monospace,monospace;color:#cdd3e0;backdrop-filter:blur(6px);user-select:none;";
+    box.innerHTML = "<div style='letter-spacing:.14em;opacity:.6;margin-bottom:8px'>RESPONSE CURVE</div>";
+    const c = document.createElement("canvas");
+    c.width = CM * 2 + CS; c.height = CM * 2 + CS;
+    c.style.cssText = "cursor:crosshair;display:block";
+    box.appendChild(c);
+    const readout = document.createElement("div");
+    readout.style.cssText = "margin-top:8px;opacity:.55;letter-spacing:.05em";
+    box.appendChild(readout);
+    const reset = document.createElement("button");
+    reset.textContent = "reset linear";
+    reset.style.cssText = "margin-top:8px;font:11px ui-monospace,monospace;color:#cdd3e0;" +
+      "background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 8px;cursor:pointer";
+    box.appendChild(reset);
+    document.getElementById("stage").appendChild(box);
+    curveCtx = c.getContext("2d");
+    curveCtx._readout = readout;
+
+    let drag = -1;   // 0 = handle P1, 1 = handle P2
+    const handleAt = (mx, my) => {
+      for (const [i, hx, hy] of [[0, params.curve[0], params.curve[1]], [1, params.curve[2], params.curve[3]]]) {
+        const [px, py] = toPx(hx, hy);
+        if (Math.hypot(mx - px, my - py) < 14) return i;
+      }
+      return -1;
+    };
+    c.addEventListener("mousedown", (e) => {
+      const r = c.getBoundingClientRect();
+      drag = handleAt(e.clientX - r.left, e.clientY - r.top);
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (drag < 0) return;
+      const r = c.getBoundingClientRect();
+      const x = Math.min(1, Math.max(0, (e.clientX - r.left - CM) / CS));
+      const y = Math.min(1, Math.max(0, 1 - (e.clientY - r.top - CM) / CS));
+      params.curve[drag * 2] = +x.toFixed(3);
+      params.curve[drag * 2 + 1] = +y.toFixed(3);
+      saveParams();
+    });
+    window.addEventListener("mouseup", () => { drag = -1; });
+    reset.addEventListener("click", () => {
+      params.curve = [0.33, 0.33, 0.66, 0.66]; saveParams();
+    });
+  }
+
+  function drawCurveEditor(liveX) {
+    const g = curveCtx; if (!g) return;
+    const [x1, y1, x2, y2] = params.curve;
+    g.clearRect(0, 0, g.canvas.width, g.canvas.height);
+    // frame + grid
+    g.strokeStyle = "rgba(255,255,255,0.08)"; g.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const vx = toPx(i / 4, 0)[0], vy = toPx(0, i / 4)[1];
+      g.beginPath(); g.moveTo(vx, CM); g.lineTo(vx, CM + CS); g.stroke();
+      g.beginPath(); g.moveTo(CM, vy); g.lineTo(CM + CS, vy); g.stroke();
+    }
+    // linear reference (diagonal)
+    g.strokeStyle = "rgba(255,255,255,0.18)"; g.setLineDash([3, 3]);
+    let p = toPx(0, 0), q = toPx(1, 1);
+    g.beginPath(); g.moveTo(p[0], p[1]); g.lineTo(q[0], q[1]); g.stroke(); g.setLineDash([]);
+    // curve
+    g.strokeStyle = "#8ec9ff"; g.lineWidth = 2; g.beginPath();
+    for (let i = 0; i <= 40; i++) { const [px, py] = toPx(i / 40, applyCurve(i / 40)); i ? g.lineTo(px, py) : g.moveTo(px, py); }
+    g.stroke();
+    // handle guide lines
+    g.strokeStyle = "rgba(200,168,255,0.5)"; g.lineWidth = 1;
+    for (const [ox, oy, hx, hy] of [[0, 0, x1, y1], [1, 1, x2, y2]]) {
+      const a = toPx(ox, oy), b = toPx(hx, hy);
+      g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+    }
+    // handles
+    for (const [hx, hy] of [[x1, y1], [x2, y2]]) {
+      const [px, py] = toPx(hx, hy);
+      g.fillStyle = "#c6a8ff"; g.beginPath(); g.arc(px, py, 5, 0, 7); g.fill();
+    }
+    // live input dot (where the hand currently sits on the curve)
+    if (liveX != null) {
+      const [px, py] = toPx(liveX, applyCurve(liveX));
+      g.fillStyle = "#7fffd0"; g.beginPath(); g.arc(px, py, 4, 0, 7); g.fill();
+    }
+    g._readout.textContent = "[" + params.curve.join(", ") + "]";
+  }
+
   // ---- Boot ----
   (async () => {
+    try { Object.assign(params, await (await fetch("./defaults.json", { cache: "no-store" })).json()); } catch (e) {}
+    if (TUNING) mountCurveEditor();
     await preload();
-    drawFrame(0);
+    drawFrame(0);                  // bud sits ready beneath the intro overlay
+    requestAnimationFrame(loop);   // idle breathing runs behind the overlay
     veil.classList.add("hidden");
-    startCam();          // async; loop runs with mouse fallback until hand is ready
-    requestAnimationFrame(loop);
+    if (TUNING) {                  // skip the intro while tuning — go straight to live
+      introPrompt.style.display = "none";
+      intro.classList.add("gone");
+      startCam();
+      cam.classList.add("show");
+    } else {
+      intro.classList.add("ready");  // fade the prompt in
+      await wait(2000);              // ~2s of "ready to enter a new world?"
+      begin();
+    }
   })();
 </script>
 </body>

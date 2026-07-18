@@ -13,7 +13,6 @@ const path = require('path');
 
 const ROOT = __dirname;
 const PORT = process.env.PORT || 3000;
-const STATE_FILE = path.join(ROOT, 'particles', 'defaults.json');
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
@@ -25,13 +24,20 @@ const MIME = {
 
 http.createServer((req, res) => {
   // ── tuner persistence endpoint ──
-  if (req.method === 'POST' && req.url === '/__tune') {
+  // POST /__tune[?to=<project>/defaults.json] → writes body to that defaults.json.
+  // Defaults to particles for back-compat. Target must stay under ROOT and be a defaults.json.
+  if (req.method === 'POST' && req.url.split('?')[0] === '/__tune') {
+    const rel = new URL(req.url, 'http://x').searchParams.get('to') || 'particles/defaults.json';
+    const target = path.join(ROOT, rel);
+    if (!target.startsWith(ROOT + path.sep) || path.basename(target) !== 'defaults.json') {
+      res.writeHead(400); res.end('bad target'); return;
+    }
     let body = '';
     req.on('data', c => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
       try {
         JSON.parse(body);                     // validate before writing
-        fs.writeFileSync(STATE_FILE, body);
+        fs.writeFileSync(target, body);
         res.writeHead(200); res.end('ok');
       } catch (e) { res.writeHead(400); res.end('bad json'); }
     });
@@ -48,4 +54,4 @@ http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream' });
     res.end(data);
   });
-}).listen(PORT, () => console.log(`tune server on http://localhost:${PORT}  (tuner → ${path.relative(ROOT, STATE_FILE)})`));
+}).listen(PORT, () => console.log(`tune server on http://localhost:${PORT}  (tuner writes → <project>/defaults.json)`));
