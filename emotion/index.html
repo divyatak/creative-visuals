@@ -63,6 +63,16 @@
     transition: opacity 0.6s ease; }
   #veil.hidden { opacity: 0; pointer-events: none; }
 
+  /* Post-intro prompt: "close your hand" arms the gesture scrub */
+  #hint {
+    position: absolute; left: 0; right: 0; bottom: 8%; z-index: 4;
+    text-align: center; font-size: 15px; letter-spacing: 0.22em; font-weight: 300;
+    color: #cdd3e0; opacity: 0; pointer-events: none;
+    text-shadow: 0 0 24px rgba(150,190,255,0.35);
+    transition: opacity 0.9s ease;
+  }
+  #hint.show { opacity: 0.75; animation: breathe 3.4s ease-in-out infinite; }
+
   #debug { position: absolute; right: 12px; top: 12px; font-size: 11px; opacity: 0.5;
     font-family: ui-monospace, monospace; text-align: right; display: none; white-space: pre; }
 </style>
@@ -72,6 +82,7 @@
     <canvas id="frame" width="720" height="1280"></canvas>
     <video id="cam" playsinline muted autoplay></video>
     <div id="debug"></div>
+    <div id="hint">close your hand to begin</div>
     <div id="intro">
       <div id="introPrompt">ready to enter a new world?</div>
       <div id="count"></div>
@@ -96,7 +107,9 @@
       rawMin: 0.35,          // gathered-bud spread ratio (tune in step 2)
       rawMax: 1.50,          // splayed spread ratio
       completeAt: 0.04,      // signal near fully-gathered = "closed the flower"
-      holdMs: 500
+      holdMs: 500,
+      armBelow: 0.15,        // "trigger position": spread this low = fingers closed
+      armHoldMs: 350         // ...held this long before the gesture scrub takes over
     }
   ];
   const DEBUG = new URLSearchParams(location.search).has("debug");
@@ -159,6 +172,7 @@
   const ctx = canvas.getContext("2d");
   const CW = canvas.width, CH = canvas.height;
   const veil = document.getElementById("veil");
+  const hint = document.getElementById("hint");
   const dbg = document.getElementById("debug");
   if (DEBUG) dbg.style.display = "block";
 
@@ -264,22 +278,39 @@
   // ---- Main loop ----
   let smooth = 0;              // resting state = closed bud
   let idleAmt = 0;            // 0..1 ramp: how "at rest" we are (no hand)
+  let armed = false;         // gesture scrub stays locked until the closed-hand trigger
+  let armHoldStart = 0;      // ms timestamp the closed-hand hold began (0 = not holding)
+
+  // "trigger position": fingers closed = spread signal near 0, held briefly.
+  // Until armed, the bud only breathes; arming hands control over to the scrub.
+  function tryArm(now) {
+    if (armed) return;
+    const closed = (rawSignal != null && rawSignal <= st.armBelow);
+    if (!closed) { armHoldStart = 0; return; }
+    if (!armHoldStart) armHoldStart = now;
+    if (now - armHoldStart >= st.armHoldMs) {
+      armed = true;
+      hint.classList.remove("show");   // fade the prompt away
+    }
+  }
 
   function loop() {
     detectHands();
     const now = performance.now();
+    tryArm(now);
 
     // `smooth` is the One-Euro-filtered spread, set in detectHands.
     // With no hand it simply holds the last filtered pose.
-    const idle = (rawSignal == null);
+    // Before arming, treat everything as "idle" so the hand can't drive the scrub.
+    const idle = armed ? (rawSignal == null) : true;
 
     // ease idle strength in/out (0 = hand driving, 1 = at rest)
     idleAmt += ((idle ? 1 : 0) - idleAmt) * 0.03;
 
-    // gesture -> response curve -> playhead position (in frames)
+    // gesture -> response curve -> playhead position (in frames); locked to the bud until armed
     const shaped = applyCurve(smooth);
     const s = st.invert ? (1 - shaped) : shaped;
-    let frameF = s * (st.count - 1);
+    let frameF = armed ? s * (st.count - 1) : 0;
 
     // idle "breathing": gently scrub the real video across a span of frames so the bud
     // stirs. wide enough span (IDLE_RANGE) that each step is tiny -> reads as motion, not stutter.
@@ -298,7 +329,8 @@
         "raw   " + (rawSignal != null ? rawSignal.toFixed(2) : "--") +
         "\nsmooth " + smooth.toFixed(2) +
         "\nframe  " + idx + "/" + (st.count - 1) +
-        "\nhand   " + (rawSignal != null ? "yes" : "no");
+        "\nhand   " + (rawSignal != null ? "yes" : "no") +
+        "\narmed  " + (armed ? "yes" : (armHoldStart ? "closing " + Math.round(now - armHoldStart) + "ms" : "no"));
     }
     requestAnimationFrame(loop);
   }
@@ -330,6 +362,7 @@
     intro.classList.add("gone");   // soft 1.4s fade -> the bud breathes into view
     await wait(500);
     cam.classList.add("show");     // ease the corner self-view in last
+    if (!armed) hint.classList.add("show");   // "close your hand to begin"
   }
 
   // ---- Live curve editor (only mounted with ?tune on localhost) ----
@@ -454,7 +487,8 @@
     drawFrame(0);                  // bud sits ready beneath the intro overlay
     requestAnimationFrame(loop);   // idle breathing runs behind the overlay
     veil.classList.add("hidden");
-    if (TUNING) {                  // skip the intro while tuning — go straight to live
+    if (TUNING) {                  // skip the intro + arm gate while tuning — go straight to live
+      armed = true;
       introPrompt.style.display = "none";
       intro.classList.add("gone");
       startCam();
