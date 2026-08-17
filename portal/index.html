@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Portal</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #05060a; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  video { display: none; }
+  #hint {
+    position: fixed; left: 50%; bottom: 32px; transform: translateX(-50%);
+    font-family: monospace; font-size: 13px; letter-spacing: 2px;
+    color: rgba(255,255,255,0.4); pointer-events: none; text-align: center;
+    text-shadow: 0 1px 8px rgba(0,0,0,0.9); line-height: 1.8;
+  }
+  /* tuning panels — only injected when the URL has ?tune, and only on localhost */
+  #panels {
+    position: fixed; top: 16px; right: 16px; z-index: 20;
+    display: flex; flex-direction: column; gap: 10px; align-items: flex-end;
+    max-height: 94vh; overflow-y: auto;
+  }
+  .panel {
+    width: 236px;
+    background: rgba(8,16,20,0.72); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    border: 1px solid rgba(120,200,220,0.18); border-radius: 10px;
+    padding: 10px 12px; font: 11px monospace; color: rgba(200,235,245,0.85);
+    cursor: auto; user-select: none;
+  }
+  .panel.collapsed .row, .panel.collapsed .panel-foot { display: none; }
+  .panel h3 {
+    font-size: 11px; letter-spacing: 1px; font-weight: normal; margin: 0 0 6px;
+    color: rgba(160,220,235,0.7); display: flex; justify-content: space-between; cursor: pointer;
+  }
+  .panel .row { margin: 7px 0; }
+  .panel .row label { display: flex; justify-content: space-between; margin-bottom: 2px; color: rgba(190,225,235,0.65); }
+  .panel .row label span { color: rgba(150,235,210,0.95); }
+  .panel input[type=range] { width: 100%; height: 14px; accent-color: #5fd8c8; cursor: pointer; }
+  .panel input[type=color] {
+    width: 100%; height: 22px; padding: 0; cursor: pointer;
+    background: none; border: 1px solid rgba(120,200,220,0.25); border-radius: 4px;
+  }
+  .panel input[type=color]::-webkit-color-swatch-wrapper { padding: 2px; }
+  .panel input[type=color]::-webkit-color-swatch { border: none; border-radius: 2px; }
+  .panel-foot { margin-top: 10px; display: flex; gap: 8px; }
+  .panel-foot button {
+    flex: 1; background: rgba(95,216,200,0.12); color: rgba(180,235,225,0.9);
+    border: 1px solid rgba(120,200,220,0.25); border-radius: 6px; padding: 5px; font: 10px monospace; cursor: pointer;
+  }
+  .panel-foot button:hover { background: rgba(95,216,200,0.22); }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="stage"></canvas>
+<div id="hint">starting camera&hellip;</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18";
+
+// ---------------------------------------------------------------------------
+// PORTAL — both hands hold a quad open. Thumb tip + index tip of each hand are
+// the four corners, so the window is a deformable polygon: pinch and it seals,
+// spread and it opens, flip a hand and it crosses into an hourglass.
+//
+// Inside is a flock of tetrahedra. The contents are a CONTAINER, not a hole —
+// the little world travels with your hands and keeps running while sealed — but
+// its SCALE is fixed in screen pixels, so opening wider admits more of the
+// world rather than magnifying the same slice of it.
+// ---------------------------------------------------------------------------
+
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+const videoEl = document.getElementById("cam");
+const hintEl = document.getElementById("hint");
+
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+resize();
+window.addEventListener("resize", resize);
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+// ---------------------------------------------------------------------------
+// Tunables. defaults.json is the source of truth and overrides these for
+// everyone; the ?tune panels write straight back to it through tune-server, so
+// a value is saved the moment you drag it. Locked to localhost, so the
+// deployed site can never show the tuner.
+// ---------------------------------------------------------------------------
+const DEFAULTS = {
+  // portal
+  openMin: 0.003, openMax: 0.030,   // quad area (fraction of screen) -> sealed / fully open
+  minCutoff: 1.4, beta: 0.010,      // One Euro smoothing on the fingertips
+  warp: 0.0,                        // 0 = rigid, 1 = full quad shear (see fieldPos)
+  worldScale: 1.0,                  // fixed pixel scale of the world
+  radius: 0.25,                     // corner rounding, as a fraction of each corner's shorter edge
+  opacity: 1.0,                     // deliberate see-through, unlike the old size-linked fade
+  color: "#8ef0ea",                 // base hue of the flock
+  hueJitter: 0.08,                  // spread of hue across the flock, in turns
+
+  // flock
+  bCount: 240, bSize: 11, bStretch: 1.15, bFill: 0.35,
+  bPerc: 0.11, bSep: 0.042, bCoh: 0.9, bAli: 1.4, bSepF: 0.055,
+  bSpeed: 0.16, bTurn: 3.4, bMargin: 70,
+  bBank: 0.55, bRoll: 0.0,
+  // firefly blink: charge -> fire -> decay, each flash nudging the others
+  bBlink: 0.36,      // charge rate (flashes per second at spread 0)
+  bSpread: 0.17,     // how much individual rates differ, +/- fraction
+  bFlashDur: 0.06,   // seconds for a flash to fall to 2%
+  bBase: 0.08,       // resting glow between flashes
+  bSwell: 0.22,      // how much the body grows at peak flash
+  bSync: 1.0, bGlow: 1.0
+};
+
+const IS_LOCAL = ["localhost", "127.0.0.1", "::1", ""].includes(location.hostname);
+const TUNING = IS_LOCAL && new URLSearchParams(location.search).has("tune");
+
+const params = Object.assign({}, DEFAULTS);
+try { Object.assign(params, await (await fetch("./defaults.json", { cache: "no-store" })).json()); } catch (e) {}
+
+// Persist edits to defaults.json (debounced). Fails silently under a plain
+// static server, which is fine — that just means no saving.
+let _saveTimer = 0;
+const saveParams = () => {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    fetch("/__tune?to=portal/defaults.json", { method: "POST", body: JSON.stringify(params, null, 2) }).catch(() => {});
+  }, 400);
+};
+
+// ---- One Euro filter ------------------------------------------------------
+// Smooths hard when a fingertip is still, eases off when it moves fast. One
+// instance per corner axis so a fast hand does not drag the other corners.
+const DCUTOFF = 1.0;
+function makeEuro() {
+  let x = null, dx = 0, t = 0;
+  const alpha = (cut, dt) => { const tau = 1 / (2 * Math.PI * cut); return 1 / (1 + tau / dt); };
+  return {
+    reset() { x = null; dx = 0; },
+    filter(v, tMs) {
+      if (x === null) { x = v; t = tMs; return v; }
+      let dt = (tMs - t) / 1000; if (dt <= 0) dt = 1 / 60;
+      t = tMs;
+      const d = (v - x) / dt;
+      dx += alpha(DCUTOFF, dt) * (d - dx);
+      const cut = params.minCutoff + params.beta * Math.abs(dx);
+      x += alpha(cut, dt) * (v - x);
+      return x;
+    }
+  };
+}
+const euro = [0, 1, 2, 3].map(() => ({ x: makeEuro(), y: makeEuro() }));
+function euroResetAll() { for (const e of euro) { e.x.reset(); e.y.reset(); } }
+
+// ---------------------------------------------------------------------------
+// Hand tracking
+// ---------------------------------------------------------------------------
+const THUMB_TIP = 4, INDEX_TIP = 8;
+let handLandmarker = null, videoReady = false, lastDetect = 0;
+let rawCorners = null, corners = null, hadHands = false;
+
+async function start() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: "user" }
+    });
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    videoReady = true;
+    hintEl.textContent = "loading hand tracking…";
+  } catch (e) {
+    hintEl.textContent = "no camera — drag with the mouse to hold a portal open";
+    return;
+  }
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO", numHands: 2,
+      minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
+    });
+    hintEl.textContent = "pinch both hands, then open your fingers and pull apart";
+  } catch (e) {
+    hintEl.textContent = "hand tracking failed to load";
+  }
+}
+start();
+
+// Video is drawn mirrored and fitted whole — contain, not cover, so nothing is
+// cropped and the feed never reads as zoomed in. Landmarks use the same map.
+function videoFit() {
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  if (!vw) return null;
+  const s = Math.min(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s;
+  return { dw, dh, dx: (W - dw) / 2, dy: (H - dh) / 2 };
+}
+function lmToScreen(lm, fit) {
+  return { x: W - (fit.dx + lm.x * fit.dw), y: fit.dy + lm.y * fit.dh };
+}
+
+// Build the quad from two hands. The hand further left on screen owns the left
+// edge; within each hand the corners are bound to the fingers themselves —
+// index fingers take the top edge, thumbs the bottom — and are never re-sorted
+// into a tidy shape. Flip a hand over and that side's edge crosses the other,
+// so the quad folds into an hourglass instead of staying a straight polygon.
+function readCorners(hands, fit) {
+  if (hands.length < 2) return null;
+  const sides = hands.slice(0, 2).map(lm => {
+    const thumb = lmToScreen(lm[THUMB_TIP], fit);
+    const index = lmToScreen(lm[INDEX_TIP], fit);
+    return { thumb, index, midX: (thumb.x + index.x) / 2 };
+  });
+  sides.sort((p, q) => p.midX - q.midX);
+  const L = sides[0], R = sides[1];
+  return [L.index, R.index, R.thumb, L.thumb];
+}
+
+function detectHands() {
+  if (!handLandmarker || !videoReady) return;
+  const now = performance.now();
+  if (now - lastDetect < 33) return;
+  lastDetect = now;
+  const fit = videoFit();
+  if (!fit) return;
+  let res;
+  try { res = handLandmarker.detectForVideo(videoEl, now); } catch (e) { return; }
+  rawCorners = readCorners((res && res.landmarks) || [], fit);
+}
+
+// ---- mouse fallback: drag a diagonal to hold a rectangle open --------------
+let mouseDown = false, mouseA = null, mouseB = null;
+canvas.addEventListener("mousedown", e => { mouseDown = true; mouseA = { x: e.clientX, y: e.clientY }; mouseB = { x: e.clientX, y: e.clientY }; });
+window.addEventListener("mousemove", e => { if (mouseDown) mouseB = { x: e.clientX, y: e.clientY }; });
+window.addEventListener("mouseup", () => { mouseDown = false; });
+function mouseCorners() {
+  if (!mouseDown || !mouseA || !mouseB) return null;
+  const x0 = Math.min(mouseA.x, mouseB.x), x1 = Math.max(mouseA.x, mouseB.x);
+  const y0 = Math.min(mouseA.y, mouseB.y), y1 = Math.max(mouseA.y, mouseB.y);
+  return [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
+}
+
+// ---- TEMPORARY: a parked portal in the bottom-left so the flock can be tuned
+// without holding both hands up. Tuning-only, and hands or a mouse drag always
+// take priority over it. Toggle with p.
+let PREVIEW = TUNING;
+function previewCorners() {
+  if (!PREVIEW) return null;
+  const w = Math.min(360, W * 0.32), h = w * 0.75;
+  const x0 = 28, y1 = H - 28;
+  return [{ x: x0, y: y1 - h }, { x: x0 + w, y: y1 - h }, { x: x0 + w, y: y1 }, { x: x0, y: y1 }];
+}
+
+// ---------------------------------------------------------------------------
+// Quad geometry
+// ---------------------------------------------------------------------------
+// Summed absolute triangle areas, not the shoelace formula: once the quad is
+// allowed to cross itself the two lobes wind in opposite directions, and a
+// signed area would cancel them out and read a wide-open hourglass as sealed.
+function triArea(a, b, c) {
+  return Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) / 2;
+}
+function quadArea(c) { return triArea(c[0], c[1], c[2]) + triArea(c[0], c[2], c[3]); }
+
+function quadDims(c) {
+  const top = Math.hypot(c[1].x - c[0].x, c[1].y - c[0].y);
+  const bot = Math.hypot(c[2].x - c[3].x, c[2].y - c[3].y);
+  const lft = Math.hypot(c[3].x - c[0].x, c[3].y - c[0].y);
+  const rgt = Math.hypot(c[2].x - c[1].x, c[2].y - c[1].y);
+  return { qw: Math.max(1, (top + bot) / 2), qh: Math.max(1, (lft + rgt) / 2) };
+}
+
+// (u,v) in [0,1]^2 -> screen point inside the quad
+function mapUV(c, u, v, out) {
+  const topX = c[0].x + (c[1].x - c[0].x) * u, topY = c[0].y + (c[1].y - c[0].y) * u;
+  const botX = c[3].x + (c[2].x - c[3].x) * u, botY = c[3].y + (c[2].y - c[3].y) * u;
+  out.x = topX + (botX - topX) * v;
+  out.y = topY + (botY - topY) * v;
+  return out;
+}
+const _p = { x: 0, y: 0 }, _m = { x: 0, y: 0 };
+
+// The world's own size in screen pixels. Set from the viewport, never from the
+// quad — that is what keeps the field's scale fixed while the portal changes.
+let WORLD = 900;
+function sizeWorld() { WORLD = Math.min(W, H) * params.worldScale; }
+
+// Field space -> screen, blended between two placements by params.warp.
+//
+// The bilinear route follows the quad exactly, but a quad with unequal opposite
+// edges is not an affine shape — the map stretches across it, so regular
+// structure comes out distorted. That is the "world skews with your hands"
+// behaviour. The rigid route places the world with rotation and translation
+// only, so it never shears and the quad merely crops it. warp mixes the two.
+function fieldPos(view, u, v, out) {
+  const uq = 0.5 + (u - 0.5) * view.sx;
+  const vq = 0.5 + (v - 0.5) * view.sy;
+  const dx = (u - 0.5) * WORLD, dy = (v - 0.5) * WORLD;
+  const rx = view.cx + dx * view.ca - dy * view.sa;
+  const ry = view.cy + dx * view.sa + dy * view.ca;
+  if (view.warp > 0.001) {
+    mapUV(view.c, uq, vq, _m);
+    out.x = rx + (_m.x - rx) * view.warp;
+    out.y = ry + (_m.y - ry) * view.warp;
+  } else {
+    out.x = rx; out.y = ry;
+  }
+  // Generous slack: clipping is what makes this correct, the test only saves
+  // work. It has to stay loose because it is measured against the quad's
+  // average width and height, while the pen the flock lives in is the real
+  // polygon — which reaches further out than that average at a wide corner.
+  return uq > -0.25 && uq < 1.25 && vq > -0.25 && vq < 1.25;
+}
+
+// The opening expressed back in field units — the live walls the flock feels.
+// Always centred on 0.5 because the world is pinned to the quad's middle, so
+// only the half-extents change as you open, close and skew your hands. The
+// floor keeps a sealed portal from crushing everything onto a single point and
+// destroying the flock: squeezing them is the good part, deleting them is not.
+const bounds = { hu: 0.5, hv: 0.5 };
+const MIN_PEN_PX = 130;
+function setBounds(qw, qh) {
+  const floor = MIN_PEN_PX / (2 * WORLD);
+  bounds.hu = clamp(qw / (2 * WORLD), floor, 0.5);
+  bounds.hv = clamp(qh / (2 * WORLD), floor, 0.5);
+}
+
+// The pen: the actual four-sided opening, expressed in field units, with an
+// inward unit normal per edge. The flock steers off THESE, not off a rectangle
+// fitted inside them — so a trapezoid pens like a trapezoid and the walls sit
+// exactly where you are holding them.
+//
+// Getting here is just the rigid placement run backwards: rotate each screen
+// corner about the quad's centre by -angle and divide by WORLD. Because the
+// centre is the corners' own average, it always lands on (0.5, 0.5) in field
+// space, which is why the normals can simply be pointed at it.
+const pen = [{ u: 0, v: 0 }, { u: 0, v: 0 }, { u: 0, v: 0 }, { u: 0, v: 0 }];
+const penN = [{ x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }];
+
+function setPen(c, cx, cy, ca, sa) {
+  for (let i = 0; i < 4; i++) {
+    const dx = c[i].x - cx, dy = c[i].y - cy;
+    pen[i].u = 0.5 + (dx * ca + dy * sa) / WORLD;
+    pen[i].v = 0.5 + (-dx * sa + dy * ca) / WORLD;
+  }
+  // absolute triangle areas, so a crossed quad still measures as open
+  const a = triArea(pen[0], pen[1], pen[2]) + triArea(pen[0], pen[2], pen[3]);
+  const minA = (MIN_PEN_PX / WORLD) * (MIN_PEN_PX / WORLD);
+  if (a > 1e-12 && a < minA) {
+    // swell the pen about its centre rather than let a sealing portal crush
+    // the whole flock onto one point and destroy its structure
+    const k = Math.min(Math.sqrt(minA / a), 60);
+    for (const p of pen) { p.u = 0.5 + (p.u - 0.5) * k; p.v = 0.5 + (p.v - 0.5) * k; }
+  }
+  for (let i = 0; i < 4; i++) {
+    const p = pen[i], q = pen[(i + 1) % 4];
+    let nx = -(q.v - p.v), ny = q.u - p.u;
+    const L = Math.hypot(nx, ny) || 1;
+    nx /= L; ny /= L;
+    if (nx * (0.5 - p.u) + ny * (0.5 - p.v) < 0) { nx = -nx; ny = -ny; }
+    penN[i].x = nx; penN[i].y = ny;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Palette — the flock's colour, spread over HUES buckets across the jitter
+// range. Every body keeps a fixed bucket index for life, so widening the jitter
+// re-spreads the same flock instead of reshuffling who is what colour.
+//
+// Bucketing is also what keeps drawing cheap: bodies are batched per
+// (brightness tier x hue bucket), so the whole flock is a few dozen strokes
+// however many of them there are.
+// ---------------------------------------------------------------------------
+const HUES = 9;
+let palette = [];
+
+function hexToHsl(hex) {
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || "");
+  if (!m) return { h: 0.48, s: 0.8, l: 0.75 };
+  const r = parseInt(m[1], 16) / 255, g = parseInt(m[2], 16) / 255, bl = parseInt(m[3], 16) / 255;
+  const mx = Math.max(r, g, bl), mn = Math.min(r, g, bl), d = mx - mn;
+  const l = (mx + mn) / 2;
+  if (d < 1e-6) return { h: 0, s: 0, l };
+  const s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+  let h;
+  if (mx === r) h = ((g - bl) / d + (g < bl ? 6 : 0)) / 6;
+  else if (mx === g) h = ((bl - r) / d + 2) / 6;
+  else h = ((r - g) / d + 4) / 6;
+  return { h, s, l };
+}
+const css = (h, s, l, a) => "hsla(" + (((h % 1) + 1) % 1 * 360).toFixed(1) + "," + (s * 100).toFixed(0) + "%," + (l * 100).toFixed(0) + "%," + a + ")";
+
+function makeGlow(hue, sat) {
+  const size = 96;
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  const g = c.getContext("2d");
+  const grad = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  grad.addColorStop(0, css(hue, sat * 0.35, 0.96, 1));
+  grad.addColorStop(0.2, css(hue, sat, 0.70, 0.6));
+  grad.addColorStop(0.55, css(hue, sat, 0.45, 0.14));
+  grad.addColorStop(1, css(hue, sat, 0.30, 0));
+  g.fillStyle = grad;
+  g.fillRect(0, 0, size, size);
+  return c;
+}
+
+function buildPalette() {
+  const base = hexToHsl(params.color);
+  const sat = Math.max(0.25, base.s);
+  palette = [];
+  for (let i = 0; i < HUES; i++) {
+    const h = base.h + ((i + 0.5) / HUES - 0.5) * params.hueJitter;
+    palette.push({
+      soft: css(h, sat, 0.55, 1),
+      hot: css(h, Math.min(1, sat * 0.9), 0.93, 1),
+      sprite: makeGlow(h, sat)
+    });
+  }
+}
+
+function blot(sprite, x, y, r, alpha) {
+  if (alpha <= 0.002 || r <= 0.2) return;
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(sprite, x - r, y - r, r * 2, r * 2);
+}
+
+// ---------------------------------------------------------------------------
+// THE FLOCK — tetrahedra that fly where they are pointed. Orientation is taken
+// entirely from velocity: the nose leads, and the body rolls into its turns the
+// way anything with lift does. Nothing tumbles at random, so a body's attitude
+// always tells you where it is going.
+//
+// They also carry the fireflies' integrate-and-fire blink: each charges at its
+// own rate and flashes when it tops out, and every flash nudges the others
+// forward, so the flock drifts into synchrony and loosens again.
+// ---------------------------------------------------------------------------
+const FLOCK = (() => {
+  let b = [];
+  function rebuild() {
+    const N = Math.max(4, Math.round(params.bCount));
+    while (b.length > N) b.pop();
+    while (b.length < N) {
+      const a = rnd(0, Math.PI * 2);
+      b.push({
+        u: rnd(0.5 - bounds.hu, 0.5 + bounds.hu), v: rnd(0.5 - bounds.hv, 0.5 + bounds.hv),
+        vu: Math.cos(a) * 0.1, vv: Math.sin(a) * 0.1,
+        head: a, turnRate: 0, roll: 0, spiral: rnd(0, Math.PI * 2),
+        spin: Math.random() < 0.5 ? -1 : 1,
+        hue: (Math.random() * HUES) | 0,     // fixed for life; see buildPalette
+        // rvar is this body's fixed deviation from the flock's blink rate; the
+        // spread dial scales it, so widening the spread re-fans the same bodies
+        ph: Math.random(), rvar: rnd(-1, 1), flash: 0
+      });
+    }
+  }
+
+  // A directional tetrahedron: one vertex is the nose on the local +x axis, the
+  // other three form the base ring behind it. Not the symmetric corner-of-a-cube
+  // arrangement — that has no front, which is exactly what looked random.
+  const BASE_X = -0.5, BASE_R = 0.62;
+  const TV = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  function shapeVerts(noseLen) {
+    TV[0][0] = noseLen; TV[0][1] = 0; TV[0][2] = 0;
+    for (let k = 0; k < 3; k++) {
+      const a = Math.PI / 2 + k * (Math.PI * 2 / 3);
+      TV[k + 1][0] = BASE_X;
+      TV[k + 1][1] = Math.cos(a) * BASE_R;
+      TV[k + 1][2] = Math.sin(a) * BASE_R;
+    }
+  }
+  const TE = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+  const TF = [[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];   // the four faces
+  const vx = [0, 0, 0, 0], vy = [0, 0, 0, 0];
+  const TIERS = 5;   // brightness buckets, so the whole flock is a few strokes
+
+  return {
+    rebuild,
+    update(dt) {
+      const N = b.length;
+      const PERC = params.bPerc, SEP = params.bSep;
+      const marg = params.bMargin / WORLD;
+      const MAXS = params.bSpeed, MINS = MAXS * 0.38;
+      const smooth = Math.min(1, dt * 8);
+      let fired = 0;
+
+      for (let i = 0; i < N; i++) {
+        const p = b[i];
+        let cu = 0, cv = 0, au = 0, av = 0, su = 0, sv = 0, n = 0;
+        for (let j = 0; j < N; j++) {
+          if (i === j) continue;
+          const o = b[j];
+          const dx = o.u - p.u, dy = o.v - p.v;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > PERC * PERC) continue;
+          n++; cu += o.u; cv += o.v; au += o.vu; av += o.vv;
+          // Separation weighted by how close they actually are. A plain unit
+          // vector (what this used to be) pushes just as gently at touching
+          // distance as at the edge of personal space, so cohesion can balance
+          // it and bodies settle into overlapping heaps. This term is zero at
+          // the separation radius and blows up as they close, so overlap
+          // becomes the one thing the flock cannot do.
+          if (d2 < SEP * SEP && d2 > 1e-12) {
+            const d = Math.sqrt(d2);
+            const w = Math.min(SEP / d - 1, 14);
+            su -= dx / d * w; sv -= dy / d * w;
+          }
+        }
+        if (n) {
+          p.vu += ((cu / n - p.u) * params.bCoh + (au / n - p.vu) * params.bAli + su * params.bSepF) * dt;
+          p.vv += ((cv / n - p.v) * params.bCoh + (av / n - p.vv) * params.bAli + sv * params.bSepF) * dt;
+        }
+        // steer off each real edge of the opening rather than bouncing — the
+        // turn is the pretty part, and a corner now pushes from both its edges
+        for (let e = 0; e < 4; e++) {
+          const q = pen[e], nn = penN[e];
+          const d = (p.u - q.u) * nn.x + (p.v - q.v) * nn.y;
+          if (d < marg) {
+            const f = (marg - d) * params.bTurn * dt;
+            p.vu += nn.x * f; p.vv += nn.y * f;
+          }
+        }
+
+        const sp = Math.hypot(p.vu, p.vv) || 1e-6;
+        const want = clamp(sp, MINS, MAXS);
+        p.vu = p.vu / sp * want; p.vv = p.vv / sp * want;
+        p.u += p.vu * dt; p.v += p.vv * dt;
+        // and project any stray back onto the edge it crossed, so slamming the
+        // portal shut cannot leave bodies stranded outside the opening
+        for (let e = 0; e < 4; e++) {
+          const q = pen[e], nn = penN[e];
+          const d = (p.u - q.u) * nn.x + (p.v - q.v) * nn.y;
+          if (d < 0) { p.u -= nn.x * d; p.v -= nn.y * d; }
+        }
+
+        // heading straight from velocity, and bank proportional to how hard it
+        // is turning — the roll is a consequence of the flocking, not decoration
+        const h = Math.atan2(p.vv, p.vu);
+        let dh = h - p.head;
+        while (dh > Math.PI) dh -= Math.PI * 2;
+        while (dh < -Math.PI) dh += Math.PI * 2;
+        p.head = h;
+        p.turnRate += (dh / dt - p.turnRate) * smooth;
+        p.spiral += params.bRoll * p.spin * dt;
+        p.roll = clamp(-p.turnRate * params.bBank, -1.3, 1.3) + p.spiral;
+
+        // integrate-and-fire: charge climbs at this body's own rate, fires at
+        // the top, resets, and the flash decays over bFlashDur
+        p.ph += (1 + p.rvar * params.bSpread) * params.bBlink * dt;
+        if (p.ph >= 1) { p.ph = 0; p.flash = 1; fired++; }
+        p.flash *= Math.pow(0.02, dt / Math.max(0.008, params.bFlashDur));
+      }
+
+      // every flash nudges the rest forward, so the flock falls into sync
+      if (fired && params.bSync > 0) {
+        const kick = Math.min(0.05, fired * 0.0016) * params.bSync;
+        for (const p of b) if (p.flash < 0.5) p.ph = Math.min(0.999, p.ph + kick);
+      }
+    },
+
+    // `alpha` is the deliberate opacity dial only. It is NOT scaled by how far
+    // the portal is open — a small portal is a small window, not a faint one.
+    draw(view, alpha) {
+      const R = params.bSize, g = params.bGlow * alpha, fill = params.bFill;
+      shapeVerts(params.bStretch);
+      ctx.globalCompositeOperation = "lighter";
+      // Batched per (brightness tier x hue bucket), so a fully synchronised
+      // flash is still a few dozen strokes rather than one per body.
+      const cages = new Array(TIERS * HUES).fill(null);
+      const solids = new Array(TIERS * HUES).fill(null);
+
+      for (const p of b) {
+        if (!fieldPos(view, p.u, p.v, _p)) continue;
+        const lit = clamp(params.bBase + p.flash, 0, 1);
+        const tier = Math.min(TIERS - 1, (lit * TIERS) | 0);
+        const slot = tier * HUES + p.hue;
+        if (!cages[slot]) cages[slot] = new Path2D();
+        const cage = cages[slot];
+
+        const ch = Math.cos(p.head), sh = Math.sin(p.head);
+        const cr = Math.cos(p.roll), sr = Math.sin(p.roll);
+        const size = R * (1 + p.flash * params.bSwell);
+        for (let k = 0; k < 4; k++) {
+          const t = TV[k];
+          // roll about the heading axis, then swing the whole body into its heading
+          const y1 = t[1] * cr - t[2] * sr, z1 = t[1] * sr + t[2] * cr;
+          const d = size * (1 + z1 * 0.22);      // cheap depth cue on the base ring
+          vx[k] = _p.x + (t[0] * ch - y1 * sh) * d;
+          vy[k] = _p.y + (t[0] * sh + y1 * ch) * d;
+        }
+        for (const e of TE) { cage.moveTo(vx[e[0]], vy[e[0]]); cage.lineTo(vx[e[1]], vy[e[1]]); }
+        if (fill > 0.001) {
+          if (!solids[slot]) solids[slot] = new Path2D();
+          const sol = solids[slot];
+          // all four faces; where they overlap the additive blend stacks up,
+          // which shades the solid for free without any lighting maths
+          for (const f of TF) {
+            sol.moveTo(vx[f[0]], vy[f[0]]);
+            sol.lineTo(vx[f[1]], vy[f[1]]);
+            sol.lineTo(vx[f[2]], vy[f[2]]);
+            sol.closePath();
+          }
+        }
+        blot(palette[p.hue].sprite, _p.x, _p.y, R * (1.3 + p.flash * 3.2), (params.bBase + p.flash * 0.85) * g);
+      }
+
+      ctx.lineCap = "round"; ctx.lineJoin = "round";
+      for (let s = 0; s < cages.length; s++) {
+        if (!cages[s]) continue;
+        const lit = ((s / HUES | 0) + 0.5) / TIERS;
+        const pal = palette[s % HUES];
+        if (solids[s]) {
+          ctx.fillStyle = pal.soft;
+          ctx.globalAlpha = fill * alpha * (0.18 + lit * 0.5);
+          ctx.fill(solids[s]);
+        }
+        // a soft halo that swells with the flash, under an edge that is always
+        // fully opaque — the body's solidity must not depend on it blinking
+        ctx.strokeStyle = pal.soft;
+        ctx.lineWidth = 3 + lit * 5; ctx.globalAlpha = (0.08 + lit * 0.45) * g;
+        ctx.stroke(cages[s]);
+        ctx.strokeStyle = pal.hot;
+        ctx.lineWidth = 1.1; ctx.globalAlpha = alpha;
+        ctx.stroke(cages[s]);
+      }
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
+    }
+  };
+})();
+buildPalette();
+FLOCK.rebuild();
+
+// ---------------------------------------------------------------------------
+// Tuning panels
+// ---------------------------------------------------------------------------
+let syncPanels = () => {};
+
+function buildPanel(title, controls) {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  const fmt = (v, step) => (+v).toFixed(step < 0.01 ? 3 : step < 1 ? 2 : 0);
+  const rows = [];
+
+  const head = document.createElement("h3");
+  const t = document.createElement("span"); t.textContent = title;
+  const tog = document.createElement("span"); tog.textContent = "[hide]";
+  head.appendChild(t); head.appendChild(tog);
+  head.addEventListener("click", () => {
+    panel.classList.toggle("collapsed");
+    tog.textContent = panel.classList.contains("collapsed") ? "[show]" : "[hide]";
+  });
+  panel.appendChild(head);
+
+  for (const c of controls) {
+    const row = document.createElement("div"); row.className = "row";
+    const lab = document.createElement("label");
+    const isColor = c.type === "color";
+    const val = document.createElement("span");
+    val.textContent = isColor ? params[c.key] : fmt(params[c.key], c.step);
+    lab.appendChild(document.createTextNode(c.label)); lab.appendChild(val);
+    const inp = document.createElement("input");
+    if (isColor) {
+      inp.type = "color"; inp.value = params[c.key];
+    } else {
+      inp.type = "range"; inp.min = c.min; inp.max = c.max; inp.step = c.step; inp.value = params[c.key];
+    }
+    inp.addEventListener("input", () => {
+      params[c.key] = isColor ? inp.value : parseFloat(inp.value);
+      val.textContent = isColor ? params[c.key] : fmt(params[c.key], c.step);
+      if (c.rebuild) FLOCK.rebuild();
+      if (c.repalette) buildPalette();
+      saveParams();
+    });
+    rows.push({ c, inp, val, isColor });
+    row.appendChild(lab); row.appendChild(inp);
+    panel.appendChild(row);
+  }
+
+  const foot = document.createElement("div"); foot.className = "panel-foot";
+  const reset = document.createElement("button"); reset.textContent = "reset";
+  reset.addEventListener("click", () => {
+    for (const c of controls) params[c.key] = DEFAULTS[c.key];
+    FLOCK.rebuild(); buildPalette();
+    sync(); saveParams();
+  });
+  foot.appendChild(reset);
+  panel.appendChild(foot);
+
+  function sync() {
+    for (const r of rows) {
+      r.inp.value = params[r.c.key];
+      r.val.textContent = r.isColor ? params[r.c.key] : fmt(params[r.c.key], r.c.step);
+    }
+  }
+  return { panel, sync };
+}
+
+if (TUNING) {
+  const wrap = document.createElement("div"); wrap.id = "panels";
+  const built = [
+    buildPanel("PORTAL", [
+      { key: "warp", label: "warp (0 rigid)", min: 0, max: 1, step: 0.01 },
+      { key: "radius", label: "corner radius", min: 0, max: 1, step: 0.01 },
+      { key: "opacity", label: "opacity", min: 0.05, max: 1, step: 0.01 },
+      { key: "worldScale", label: "world scale", min: 0.4, max: 2.5, step: 0.01 },
+      { key: "openMin", label: "seal threshold", min: 0.0005, max: 0.02, step: 0.0005 },
+      { key: "openMax", label: "open threshold", min: 0.005, max: 0.15, step: 0.001 },
+      { key: "minCutoff", label: "smooth at rest", min: 0.1, max: 5, step: 0.05 },
+      { key: "beta", label: "snap when moving", min: 0, max: 0.05, step: 0.001 }
+    ]),
+    buildPanel("FLOCK", [
+      { key: "color", label: "colour", type: "color", repalette: true },
+      { key: "hueJitter", label: "hue jitter", min: 0, max: 1, step: 0.01, repalette: true },
+      { key: "bCount", label: "count", min: 20, max: 400, step: 10, rebuild: true },
+      { key: "bSize", label: "size", min: 3, max: 40, step: 0.5 },
+      { key: "bStretch", label: "nose length", min: 0.4, max: 4, step: 0.05 },
+      { key: "bFill", label: "solidity", min: 0, max: 1, step: 0.01 },
+      { key: "bSpeed", label: "speed", min: 0.02, max: 0.5, step: 0.005 },
+      { key: "bBank", label: "bank into turns", min: 0, max: 3, step: 0.05 },
+      { key: "bRoll", label: "barrel roll", min: 0, max: 4, step: 0.05 },
+      { key: "bPerc", label: "perception", min: 0.02, max: 0.35, step: 0.005 },
+      { key: "bSep", label: "personal space", min: 0.005, max: 0.15, step: 0.001 },
+      { key: "bCoh", label: "cohesion", min: 0, max: 4, step: 0.05 },
+      { key: "bAli", label: "alignment", min: 0, max: 5, step: 0.05 },
+      { key: "bSepF", label: "separation force", min: 0, max: 0.3, step: 0.005 },
+      { key: "bTurn", label: "wall turn", min: 0.2, max: 15, step: 0.1 },
+      { key: "bMargin", label: "wall margin px", min: 5, max: 250, step: 5 },
+      { key: "bBlink", label: "blink rate", min: 0, max: 2, step: 0.01 },
+      { key: "bSpread", label: "blink spread", min: 0, max: 1, step: 0.01 },
+      { key: "bFlashDur", label: "flash length", min: 0.01, max: 1.2, step: 0.01 },
+      { key: "bSync", label: "blink sync", min: 0, max: 3, step: 0.05 },
+      { key: "bBase", label: "resting glow", min: 0, max: 1, step: 0.01 },
+      { key: "bSwell", label: "flash swell", min: 0, max: 2, step: 0.02 },
+      { key: "bGlow", label: "glow", min: 0.1, max: 3, step: 0.05 }
+    ])
+  ];
+  for (const x of built) wrap.appendChild(x.panel);
+  document.body.appendChild(wrap);
+  syncPanels = () => { for (const x of built) x.sync(); };
+}
+
+window.addEventListener("keydown", e => {
+  if (e.key === "p" && TUNING) PREVIEW = !PREVIEW;
+  if (e.key === "[") { params.openMax = clamp(params.openMax * 1.12, 0.005, 0.15); syncPanels(); saveParams(); }
+  if (e.key === "]") { params.openMax = clamp(params.openMax / 1.12, 0.005, 0.15); syncPanels(); saveParams(); }
+});
+
+// ---------------------------------------------------------------------------
+// Frame
+// ---------------------------------------------------------------------------
+let last = performance.now();
+let openAmt = 0;
+let lastSource = "";
+
+function drawVideo() {
+  ctx.fillStyle = "#05060a";
+  ctx.fillRect(0, 0, W, H);
+  const fit = videoFit();
+  if (!fit) return;
+  ctx.save();
+  ctx.translate(W, 0); ctx.scale(-1, 1);
+  ctx.drawImage(videoEl, fit.dx, fit.dy, fit.dw, fit.dh);
+  ctx.restore();
+}
+
+// Rounded quad. Walks edge midpoint -> corner -> next midpoint, letting arcTo
+// cut each corner; the radius is a fraction of that corner's shorter edge, so
+// rounding stays proportional as the portal opens and never eats a short edge.
+const _mid = { x: 0, y: 0 };
+function quadPath(c) {
+  const r = params.radius;
+  ctx.beginPath();
+  if (r <= 0.001) {
+    ctx.moveTo(c[0].x, c[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(c[i].x, c[i].y);
+    ctx.closePath();
+    return;
+  }
+  ctx.moveTo((c[3].x + c[0].x) / 2, (c[3].y + c[0].y) / 2);
+  for (let i = 0; i < 4; i++) {
+    const cur = c[i], nxt = c[(i + 1) % 4], prv = c[(i + 3) % 4];
+    const e1 = Math.hypot(cur.x - prv.x, cur.y - prv.y);
+    const e2 = Math.hypot(nxt.x - cur.x, nxt.y - cur.y);
+    _mid.x = (cur.x + nxt.x) / 2; _mid.y = (cur.y + nxt.y) / 2;
+    ctx.arcTo(cur.x, cur.y, _mid.x, _mid.y, Math.max(0, r * 0.5 * Math.min(e1, e2)));
+  }
+  ctx.closePath();
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  let dt = (now - last) / 1000; if (dt > 0.05) dt = 0.05;
+  last = now;
+
+  sizeWorld();
+  detectHands();
+  drawVideo();
+
+  let target = mouseCorners() || rawCorners;
+  let source = target ? "hand" : "";
+  if (!target) { target = previewCorners(); if (target) source = "preview"; }
+  if (target) {
+    // reset the smoother when the quad changes source, so handing over between
+    // the parked preview and real hands does not swoop across the screen
+    if (!hadHands || source !== lastSource) { euroResetAll(); corners = target.map(p => ({ x: p.x, y: p.y })); }
+    hadHands = true;
+    corners = target.map((p, i) => ({ x: euro[i].x.filter(p.x, now), y: euro[i].y.filter(p.y, now) }));
+  } else {
+    hadHands = false;
+  }
+  lastSource = source;
+
+  // openness follows the quad's area: pinched fingers collapse it to a sliver.
+  // The parked preview is always fully open — it is a bench, not a gesture.
+  let want = 0;
+  if (corners && hadHands) {
+    want = source === "preview" ? 1
+      : smoothstep(params.openMin, params.openMax, quadArea(corners) / (W * H));
+  }
+  openAmt += (want - openAmt) * (1 - Math.pow(0.001, dt));
+
+  // Step the flock only once the opening is known, so its walls are this
+  // frame's portal rather than last frame's.
+  let cx = 0, cy = 0, ca = 1, sa = 0, dims = null;
+  if (corners) {
+    const c = corners;
+    dims = quadDims(c);
+    setBounds(dims.qw, dims.qh);
+    cx = (c[0].x + c[1].x + c[2].x + c[3].x) / 4;
+    cy = (c[0].y + c[1].y + c[2].y + c[3].y) / 4;
+    // the quad's own heading, averaged over its two horizontal edges, so the
+    // rigid placement rotates with your hands without shearing
+    const ang = Math.atan2((c[1].y - c[0].y) + (c[2].y - c[3].y),
+                           (c[1].x - c[0].x) + (c[2].x - c[3].x));
+    ca = Math.cos(ang); sa = Math.sin(ang);
+    setPen(c, cx, cy, ca, sa);
+  }
+  FLOCK.update(dt);
+
+  if (corners && openAmt > 0.004) {
+    const c = corners;
+    const scale = Math.sqrt(quadArea(c));
+
+    ctx.save();
+    quadPath(c);
+    ctx.clip();
+
+    // How open the portal is decides its SIZE, not its opacity. The only fade
+    // is a hair's width either side of sealed, so it does not pop into being.
+    const alpha = params.opacity * smoothstep(0, 0.12, openAmt);
+
+    // the void behind the membrane — never flat black, so it reads as depth
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(scale, 1));
+    g.addColorStop(0, "rgba(9,14,26,1)");
+    g.addColorStop(1, "rgba(2,3,7,1)");
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = g;
+    quadPath(c); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    FLOCK.draw({
+      c, sx: WORLD / dims.qw, sy: WORLD / dims.qh,
+      cx, cy, ca, sa, warp: params.warp
+    }, alpha);
+    ctx.restore();
+
+    // mark the bench so it never gets mistaken for the piece
+    if (source === "preview") {
+      ctx.save();
+      ctx.setLineDash([4, 5]);
+      ctx.strokeStyle = "rgba(120,200,220,0.30)";
+      ctx.lineWidth = 1;
+      quadPath(corners); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.font = "10px monospace";
+      ctx.fillStyle = "rgba(120,200,220,0.45)";
+      ctx.fillText("PREVIEW BENCH — p to hide", corners[0].x, corners[0].y - 7);
+      ctx.restore();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
