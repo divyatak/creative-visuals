@@ -10,12 +10,15 @@
 <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #fff;
-    --ink: #222;
-    --ink-2: #636363;
-    --ink-3: #999;
-    --line: #eee;
-    --tile: #0b0d12;          /* the ground the sketches themselves sit on */
+    /* The sketches are all dark and lit from inside. On white each tile floats
+       as a separate rectangle; on the same black they sit in, the light in
+       them carries the page. So the ground here is theirs, not the skin's. */
+    --bg: #0a0a0a;
+    --ink: rgba(255,255,255,0.92);
+    --ink-2: rgba(255,255,255,0.5);
+    --ink-3: rgba(255,255,255,0.35);
+    --line: rgba(255,255,255,0.1);
+    --tile: #05060a;
     --font: 'Montserrat', system-ui, -apple-system, sans-serif;
     --ease-soft: cubic-bezier(0.25, 0.46, 0.45, 0.94);
     --hover-on: 0.2s;
@@ -46,7 +49,7 @@
   header { margin-bottom: clamp(2rem, 5vw, 3rem); }
   h1 { font-size: 1.15rem; font-weight: 600; letter-spacing: 0.01em; }
   .sub { margin-top: 0.35rem; color: var(--ink-2); font-weight: 300; }
-  .sub a { color: var(--ink-2); }
+  .sub a { color: var(--ink-2); text-decoration-color: rgba(255,255,255,0.25); }
   .sub a:hover { color: var(--ink); }
 
   /* The grid is the page. Nothing here competes with the pictures. */
@@ -67,7 +70,7 @@
   }
   .piece:hover img, .piece:focus-visible img {
     transform: translateY(-3px);
-    filter: brightness(1.08);
+    filter: brightness(1.12);
     transition-duration: var(--hover-on);
   }
   .piece figcaption,
@@ -130,8 +133,13 @@
     </a>
 
     <a class="piece" href="webcam/">
-      <img src="thumbs/webcam.jpg" width="900" height="600" loading="lazy" alt="A camera view rebuilt as coarse orange and teal pixels">
+      <img src="thumbs/webcam.jpg" width="900" height="600" loading="lazy" alt="Divya in the pixel mirror, her face and raised hand rebuilt in hot orange and deep blue">
       <span class="cap"><span class="name">Webcam Magic</span><span class="how">one finger</span></span>
+    </a>
+
+    <a class="piece" href="emotion/">
+      <img src="thumbs/emotion.jpg" width="900" height="600" loading="lazy" alt="A pink chrysanthemum in full bloom against near-black">
+      <span class="cap"><span class="name">(e)motion</span><span class="how">one hand</span></span>
     </a>
 
     <a class="piece" href="lenticular/">
@@ -142,7 +150,7 @@
   </div>
 
   <footer>
-    <span>In the workshop: (e)motion &middot; Audio Reactive &middot; Particle Face Mask</span>
+    <span>In the workshop: Audio Reactive &middot; Particle Face Mask</span>
     <a href="https://divyatak.art">divyatak.art</a>
   </footer>
 
