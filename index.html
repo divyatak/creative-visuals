@@ -4,27 +4,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Creative Visuals — Divya Tak</title>
-<meta name="description" content="Interactive sketches you play with your hands. Each one answers to a different gesture.">
+<meta name="description" content="Interactive sketches you play with your hands, in the browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;600&display=swap" rel="stylesheet">
 <style>
-  /* ── the divyatak.art skin, only the tokens this page uses ───────────── */
   :root {
     --bg: #fff;
     --ink: #222;
     --ink-2: #636363;
     --ink-3: #999;
     --line: #eee;
-    --surface: #fafafa;
+    --tile: #0b0d12;          /* the ground the sketches themselves sit on */
     --font: 'Montserrat', system-ui, -apple-system, sans-serif;
-    --w-light: 300; --w-reg: 400; --w-med: 600; --w-black: 800;
-    --space-sm: 0.5rem; --space-md: 1rem; --space-lg: 1.5rem;
-    --space-xl: 2rem; --space-2xl: 3rem; --space-3xl: 4rem;
-    --track-label: 0.03em;
     --ease-soft: cubic-bezier(0.25, 0.46, 0.45, 0.94);
-    --hover-on: 0.2s;    /* asymmetric: snappy in… */
-    --hover-off: 0.35s;  /* …decelerated out */
+    --hover-on: 0.2s;
+    --hover-off: 0.35s;
   }
 
   *, *::before, *::after { box-sizing: border-box; }
@@ -34,220 +29,121 @@
     background: var(--bg);
     color: var(--ink);
     font-family: var(--font);
-    font-weight: var(--w-reg);
     font-size: 16px;
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
-    text-rendering: optimizeLegibility;
   }
+  img { display: block; max-width: 100%; }
   :focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
 
-  /* The page is one left-anchored column. The margin is not leftover space:
-     it is the quiet the list is read against. */
   .page {
-    max-width: 44rem;
+    max-width: 62rem;
     margin: 0 auto;
-    padding: clamp(2rem, 7vw, var(--space-3xl)) clamp(1.25rem, 6vw, var(--space-2xl)) var(--space-3xl);
+    padding: clamp(2rem, 6vw, 3.5rem) clamp(1.25rem, 5vw, 2.5rem) 4rem;
   }
 
-  /* ── header ──────────────────────────────────────────────────────────── */
-  .back {
-    font-size: 0.78rem;
-    letter-spacing: var(--track-label);
-    margin-bottom: var(--space-2xl);
-  }
-  .back a {
-    color: var(--ink-3);
-    text-decoration: none;
-    transition: color var(--hover-off) var(--ease-soft);
-  }
-  .back a:hover { color: var(--ink); transition-duration: var(--hover-on); }
+  /* The header says the one thing you need to know and gets out of the way. */
+  header { margin-bottom: clamp(2rem, 5vw, 3rem); }
+  h1 { font-size: 1.15rem; font-weight: 600; letter-spacing: 0.01em; }
+  .sub { margin-top: 0.35rem; color: var(--ink-2); font-weight: 300; }
+  .sub a { color: var(--ink-2); }
+  .sub a:hover { color: var(--ink); }
 
-  h1 {
-    font-size: clamp(2rem, 6vw, 2.75rem);
-    font-weight: var(--w-black);
-    line-height: 1.1;
-    letter-spacing: -0.015em;
+  /* The grid is the page. Nothing here competes with the pictures. */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+    gap: clamp(1.25rem, 3vw, 2rem);
   }
-  .intro {
-    margin-top: var(--space-md);
-    max-width: 34rem;
-    text-wrap: pretty;   /* keeps the last line from stranding a word */
-    color: var(--ink-2);
-    font-weight: var(--w-light);
-    font-size: 1.05rem;
-    line-height: 1.7;
+  .piece { text-decoration: none; color: inherit; display: block; }
+  .piece img {
+    width: 100%;
+    height: auto;          /* the width/height attributes are for layout stability only */
+    aspect-ratio: 3 / 2;
+    object-fit: cover;
+    background: var(--tile);
+    transition: transform var(--hover-off) var(--ease-soft),
+                filter var(--hover-off) var(--ease-soft);
   }
-  .intro em { font-style: normal; color: var(--ink); font-weight: var(--w-reg); }
-
-  /* ── groups ──────────────────────────────────────────────────────────── */
-  .group { margin-top: var(--space-3xl); }
-  .group-head {
-    font-size: 0.8rem;
-    font-weight: var(--w-med);
-    letter-spacing: var(--track-label);
-    color: var(--ink-2);
-    border-bottom: 1px solid var(--line);
-    padding-bottom: var(--space-sm);
+  .piece:hover img, .piece:focus-visible img {
+    transform: translateY(-3px);
+    filter: brightness(1.08);
+    transition-duration: var(--hover-on);
+  }
+  .piece figcaption,
+  .piece .cap {
+    margin-top: 0.6rem;
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: var(--space-md);
+    gap: 1rem;
   }
-  .group-head .count { font-weight: var(--w-reg); color: var(--ink-3); }
-
-  .list { list-style: none; padding: 0; }
-  .list li + li { border-top: 1px solid var(--line); }
-
-  /* A row is a gesture first and a title second — the name tells you which
-     one it is, the line under it tells you what your body does. */
-  .row {
-    display: block;
-    text-decoration: none;
-    color: inherit;
-    padding: var(--space-lg) var(--space-md) var(--space-lg) var(--space-lg);
-    border-left: 2px solid transparent;
-    transition:
-      background var(--hover-off) var(--ease-soft),
-      border-color var(--hover-off) var(--ease-soft),
-      transform var(--hover-off) var(--ease-soft);
-  }
-  a.row:hover, a.row:focus-visible {
-    background: var(--surface);
-    border-left-color: var(--accent, var(--ink));
-    transform: translateX(4px);
-    transition-duration: var(--hover-on);
-  }
-
-  .row-name {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    font-size: 1.05rem;
-    font-weight: var(--w-med);
-    letter-spacing: -0.005em;
-  }
-  /* colour is a moment: a single chip of the piece's own light, and the rule
-     that arrives under your pointer. Never a fill. */
-  .dot {
-    width: 7px; height: 7px;
-    background: var(--accent, var(--ink-3));
-    flex: none;
-  }
-  .row-gesture {
-    display: block;
-    margin-top: 0.35rem;
-    max-width: 34rem;
-    color: var(--ink-2);
-    font-weight: var(--w-light);
-    line-height: 1.65;
-    text-wrap: pretty;
-  }
-  .row-need {
-    display: block;
-    margin-top: 0.6rem;
-    font-size: 0.74rem;
-    letter-spacing: var(--track-label);
-    color: var(--ink-3);
-  }
-
-  /* Not yet playable: it is simply not a link, and it says so once. */
-  .group-soon .row { cursor: default; }
-  .group-soon .row-name { color: var(--ink-2); font-weight: var(--w-reg); }
-  .group-soon .dot { background: var(--line); }
+  .name { font-size: 0.95rem; font-weight: 600; }
+  /* a portrait piece in a landscape tile: crop from nearer the top, where
+     the drawn figure is, rather than the middle */
+  .piece img.tall { object-position: center 22%; }
+  .how { font-size: 0.75rem; color: var(--ink-3); white-space: nowrap; }
 
   footer {
-    margin-top: var(--space-3xl);
-    padding-top: var(--space-lg);
+    margin-top: 4rem;
+    padding-top: 1.25rem;
     border-top: 1px solid var(--line);
-    font-size: 0.78rem;
+    font-size: 0.8rem;
     color: var(--ink-3);
     display: flex;
-    flex-direction: column;
-    gap: var(--space-sm);
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    justify-content: space-between;
   }
-  footer .sig { letter-spacing: var(--track-label); }
   footer a { color: var(--ink-2); text-decoration: none; }
   footer a:hover { color: var(--ink); }
 
   @media (prefers-reduced-motion: reduce) {
+    .piece:hover img, .piece:focus-visible img { transform: none; }
     :root { --hover-on: 0s; --hover-off: 0s; }
-    a.row:hover, a.row:focus-visible { transform: none; }
   }
 </style>
 </head>
 <body>
 <main class="page">
 
-  <p class="back"><a href="https://divyatak.art">&larr; divyatak.art</a></p>
-
   <header>
     <h1>Creative Visuals</h1>
-    <p class="intro">Sketches you play with your body. Give the camera your hands and move &mdash; each one answers to <em>a different gesture</em>.</p>
+    <p class="sub">Sketches you play with your hands, in the browser. By <a href="https://divyatak.art">Divya Tak</a>.</p>
   </header>
 
-  <section class="group">
-    <h2 class="group-head">Ready to play <span class="count">5</span></h2>
-    <ul class="list">
+  <div class="grid">
 
-      <li><a class="row" href="cloth/" style="--accent:#69bfb0">
-        <span class="row-name"><span class="dot"></span>Cloth</span>
-        <span class="row-gesture">A sheet of fabric hangs from four fingertips. Bring your hands together and it gathers into folds; pull them apart and it draws taut; move fast and it swings after you.</span>
-        <span class="row-need">Camera &middot; both hands</span>
-      </a></li>
+    <a class="piece" href="cloth/">
+      <img src="thumbs/cloth.jpg" width="900" height="600" alt="A mint sheet of cloth hanging in the dark, folded by unseen fingertips">
+      <span class="cap"><span class="name">Cloth</span><span class="how">both hands</span></span>
+    </a>
 
-      <li><a class="row" href="portal/" style="--accent:#002aff">
-        <span class="row-name"><span class="dot"></span>Portal</span>
-        <span class="row-gesture">Hold a window open between your hands &mdash; thumbs and index fingers are its four corners. Pinch and it seals, spread and it opens, and a flock of fireflies inside talks to itself in light.</span>
-        <span class="row-need">Camera &middot; both hands</span>
-      </a></li>
+    <a class="piece" href="portal/">
+      <img src="thumbs/portal.jpg" width="900" height="600" alt="A dark window held open over a pink room, with lit fireflies drifting inside it">
+      <span class="cap"><span class="name">Portal</span><span class="how">both hands</span></span>
+    </a>
 
-      <li><a class="row" href="particles/" style="--accent:#5fd8c8">
-        <span class="row-name"><span class="dot"></span>Bioluminescent Flow</span>
-        <span class="row-gesture">Sweep a hand through dark water. The algae light where you disturb them and go on drifting once you have passed.</span>
-        <span class="row-need">Camera &middot; one hand</span>
-      </a></li>
+    <a class="piece" href="particles/">
+      <img src="thumbs/particles.jpg" width="900" height="600" alt="Thousands of cyan algae with a dark hand-shaped void swept through them">
+      <span class="cap"><span class="name">Bioluminescent Flow</span><span class="how">one hand</span></span>
+    </a>
 
-      <li><a class="row" href="webcam/" style="--accent:#ff6b35">
-        <span class="row-name"><span class="dot"></span>Webcam Magic</span>
-        <span class="row-gesture">Drag one fingertip across a mirror made of pixels &mdash; ripple it, erase it, paint it warm. Hold up a peace sign to change what your finger does.</span>
-        <span class="row-need">Camera &middot; one finger</span>
-      </a></li>
+    <a class="piece" href="webcam/">
+      <img src="thumbs/webcam.jpg" width="900" height="600" loading="lazy" alt="A camera view rebuilt as coarse orange and teal pixels">
+      <span class="cap"><span class="name">Webcam Magic</span><span class="how">one finger</span></span>
+    </a>
 
-      <li><a class="row" href="lenticular/" style="--accent:#222">
-        <span class="row-name"><span class="dot"></span>(un)seen Lenticular</span>
-        <span class="row-gesture">Move across the picture and it slides between the sketch and the photograph, the way a lenticular print turns as you walk past it.</span>
-        <span class="row-need">Mouse or trackpad</span>
-      </a></li>
+    <a class="piece" href="lenticular/">
+      <img class="tall" src="thumbs/lenticular.jpg" width="414" height="638" loading="lazy" alt="A photograph of a Seoul rooftop with a drawn figure sitting on it, emerging in stripes">
+      <span class="cap"><span class="name">(un)seen Lenticular</span><span class="how">mouse</span></span>
+    </a>
 
-    </ul>
-  </section>
-
-  <section class="group group-soon">
-    <h2 class="group-head">In the workshop <span class="count">not playable yet</span></h2>
-    <ul class="list">
-
-      <li><div class="row">
-        <span class="row-name"><span class="dot"></span>(e)motion</span>
-        <span class="row-gesture">Puppet a video with one hand. Gather your fingers to a bud and open them like petals &mdash; the flower opens exactly as far as you spread.</span>
-      </div></li>
-
-      <li><div class="row">
-        <span class="row-name"><span class="dot"></span>Audio Reactive</span>
-        <span class="row-gesture">Drop in a track and twenty thousand particles breathe with it &mdash; bass expands, mids spin, highs shimmer.</span>
-      </div></li>
-
-      <li><div class="row">
-        <span class="row-name"><span class="dot"></span>Particle Face Mask</span>
-        <span class="row-gesture">A sheet of particles you can press into, like a finger in sand. Then let your face do the pressing.</span>
-      </div></li>
-
-    </ul>
-  </section>
+  </div>
 
   <footer>
-    <span>Everything runs in the browser. Nothing you show the camera leaves your machine.</span>
-    <a class="sig" href="https://divyatak.art">divyatak.art</a>
+    <span>In the workshop: (e)motion &middot; Audio Reactive &middot; Particle Face Mask</span>
+    <a href="https://divyatak.art">divyatak.art</a>
   </footer>
 
 </main>
