@@ -57,7 +57,8 @@ import { HandLandmarker, FilesetResolver } from
 // the four corners, so the window is a deformable polygon: pinch and it seals,
 // spread and it opens, flip a hand and it crosses into an hourglass.
 //
-// Inside is a flock of tetrahedra. The contents are a CONTAINER, not a hole —
+// Inside is a flock of paper-plane fireflies. The contents are a CONTAINER,
+// not a hole —
 // the little world travels with your hands and keeps running while sealed — but
 // its SCALE is fixed in screen pixels, so opening wider admits more of the
 // world rather than magnifying the same slice of it.
@@ -68,8 +69,9 @@ const ctx = canvas.getContext("2d", { alpha: false });
 const videoEl = document.getElementById("cam");
 
 let W = 0, H = 0, DPR = 1;
+let qScale = 1;      // the quality governor's dial; see QUALITY below
 function resize() {
-  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  DPR = Math.max(0.6, Math.min(window.devicePixelRatio || 1, 2) * qScale);
   W = window.innerWidth; H = window.innerHeight;
   canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
@@ -149,6 +151,75 @@ const saveParams = () => {
     fetch("/__tune?to=portal/defaults.json", { method: "POST", body: JSON.stringify(params, null, 2) }).catch(() => {});
   }, 400);
 };
+
+// ---------------------------------------------------------------------------
+// Quality governor — this has to run on machines slower than the one it was
+// made on, so rather than pick a resolution and hope, it watches how long
+// frames actually take and eases the resolution (and the cloth's substeps)
+// down until they fit, then back up when there is room to spare.
+//
+// Nothing here is a fixed target: the budget is taken from the fastest frames
+// the browser is actually delivering, which is the refresh rate it is pacing
+// us at - 60 Hz, 120 Hz, or a laptop throttled to 30. So "smooth" means
+// smooth for whatever machine it lands on.
+// ---------------------------------------------------------------------------
+const QUALITY = (() => {
+  // A short window, so it answers within a second even on a machine that is
+  // only managing ten frames of it.
+  const RING = 45;
+  const times = new Float32Array(RING), sorted = new Float32Array(RING);
+  let n = 0, filled = 0, badRuns = 0, goodRuns = 0, lastCheck = 0;
+  // The display's own pace, estimated robustly: a low percentile of a long
+  // history (one stray fast frame must not set an impossible target), snapped
+  // to the refresh rates that actually exist. On a machine that cannot keep
+  // up, the history is slow at first, the target is lenient, and as the
+  // resolution comes down the history speeds up and the target tightens -
+  // so it converges on the best pace that machine can actually hold.
+  const LONG = 300;
+  const longRing = new Float32Array(LONG), longSorted = new Float32Array(LONG);
+  let ln = 0, lfilled = 0;
+  const RATES = [1000 / 240, 1000 / 120, 1000 / 90, 1000 / 60, 1000 / 50, 1000 / 30];
+  const FLOOR = 0.45;               // below this the picture is too soft to be worth it
+  const STEP = 0.15;
+  function pct(p) {
+    sorted.set(times.subarray(0, filled)); const a = sorted.subarray(0, filled);
+    Array.prototype.sort.call(a, (x, y) => x - y);
+    return a[Math.min(filled - 1, Math.max(0, Math.round(p * (filled - 1))))];
+  }
+  function refreshMs() {
+    if (lfilled < 30) return 1000 / 60;
+    longSorted.set(longRing.subarray(0, lfilled)); const a = longSorted.subarray(0, lfilled);
+    Array.prototype.sort.call(a, (x, y) => x - y);
+    const p20 = a[Math.round(0.2 * (lfilled - 1))];
+    for (const r of RATES) if (r >= p20 * 0.85) return r;
+    return RATES[RATES.length - 1];
+  }
+  const budgetMs = () => refreshMs() * 1.35;
+  return {
+    scale: () => qScale,
+    sample(dtMs, now) {
+      longRing[ln] = dtMs; ln = (ln + 1) % LONG; if (lfilled < LONG) lfilled++;
+      times[n] = dtMs; n = (n + 1) % RING; if (filled < RING) filled++;
+      if (filled < 20 || now - lastCheck < 700) return;
+      lastCheck = now;
+      const med = pct(0.5), budget = budgetMs();
+      if (med > budget) { badRuns++; goodRuns = 0; }
+      else if (med < budget * 0.8) { goodRuns++; badRuns = 0; }
+      else { badRuns = 0; goodRuns = 0; }
+      let changed = false;
+      if (badRuns >= 2 && qScale > FLOOR) {
+        // a machine that is missing by miles gets there in one move
+        const jump = med > budget * 2.5 ? STEP * 2 : STEP;
+        qScale = Math.max(FLOOR, qScale - jump); badRuns = 0; changed = true;
+      } else if (goodRuns >= 5 && qScale < 1) {
+        qScale = Math.min(1, qScale + STEP); goodRuns = 0; changed = true;
+      }
+      if (changed) { filled = 0; n = 0; resize(); syncQuality(); }   // long history kept: it is the record of what this machine can do
+    },
+    report: () => ({ scale: +qScale.toFixed(2), budgetMs: +budgetMs().toFixed(1), medianMs: filled ? +pct(0.5).toFixed(1) : 0 })
+  };
+})();
+let syncQuality = () => {};
 
 // ---- One Euro filter ------------------------------------------------------
 // Smooths hard when a fingertip is still, eases off when it moves fast. One
@@ -759,7 +830,8 @@ const FLOCK = (() => {
 })();
 buildPalette();
 FLOCK.rebuild();
-if (TUNING) window.__portal = { params, FLOCK };   // bench-only hook for instrumenting the piece
+
+if (TUNING) window.__portal = { params, FLOCK, quality: () => QUALITY.report() };   // bench-only hook
 
 // ---------------------------------------------------------------------------
 // Tuning panels
@@ -869,8 +941,15 @@ if (TUNING) {
       { key: "bBase", label: "resting glow", min: 0, max: 1, step: 0.01 },
       { key: "bSwell", label: "flash swell", min: 0, max: 2, step: 0.02 },
       { key: "bGlow", label: "glow", min: 0.1, max: 3, step: 0.05 }
-    ])
+    ]),
   ];
+  const qLine = document.createElement("div");
+  qLine.className = "panel";
+  qLine.style.padding = "6px 12px";
+  syncQuality = () => { const q = QUALITY.report(); qLine.textContent = "quality " + q.scale + "  ·  " + q.medianMs + " ms/frame  ·  budget " + q.budgetMs + " ms"; };
+  syncQuality();
+  setInterval(syncQuality, 1000);
+  wrap.appendChild(qLine);
   for (const x of built) wrap.appendChild(x.panel);
   document.body.appendChild(wrap);
   syncPanels = () => { for (const x of built) x.sync(); };
@@ -881,6 +960,7 @@ window.addEventListener("keydown", e => {
   if (e.key === "[") { params.openMax = clamp(params.openMax * 1.12, 0.005, 0.15); syncPanels(); saveParams(); }
   if (e.key === "]") { params.openMax = clamp(params.openMax / 1.12, 0.005, 0.15); syncPanels(); saveParams(); }
 });
+
 
 // ---------------------------------------------------------------------------
 // Frame
@@ -904,32 +984,35 @@ function drawVideo() {
 // cut each corner; the radius is a fraction of that corner's shorter edge, so
 // rounding stays proportional as the portal opens and never eats a short edge.
 const _mid = { x: 0, y: 0 };
-function quadPath(c) {
+function quadPathOn(g, c) {
   const r = params.radius;
-  ctx.beginPath();
+  g.beginPath();
   if (r <= 0.001) {
-    ctx.moveTo(c[0].x, c[0].y);
-    for (let i = 1; i < 4; i++) ctx.lineTo(c[i].x, c[i].y);
-    ctx.closePath();
+    g.moveTo(c[0].x, c[0].y);
+    for (let i = 1; i < 4; i++) g.lineTo(c[i].x, c[i].y);
+    g.closePath();
     return;
   }
-  ctx.moveTo((c[3].x + c[0].x) / 2, (c[3].y + c[0].y) / 2);
+  g.moveTo((c[3].x + c[0].x) / 2, (c[3].y + c[0].y) / 2);
   for (let i = 0; i < 4; i++) {
     const cur = c[i], nxt = c[(i + 1) % 4], prv = c[(i + 3) % 4];
     const e1 = Math.hypot(cur.x - prv.x, cur.y - prv.y);
     const e2 = Math.hypot(nxt.x - cur.x, nxt.y - cur.y);
     _mid.x = (cur.x + nxt.x) / 2; _mid.y = (cur.y + nxt.y) / 2;
-    ctx.arcTo(cur.x, cur.y, _mid.x, _mid.y, Math.max(0, r * 0.5 * Math.min(e1, e2)));
+    g.arcTo(cur.x, cur.y, _mid.x, _mid.y, Math.max(0, r * 0.5 * Math.min(e1, e2)));
   }
-  ctx.closePath();
+  g.closePath();
 }
+const quadPath = c => quadPathOn(ctx, c);
 
 function frame() {
   requestAnimationFrame(frame);
   if (window.__portal) window.__portal.frames = (window.__portal.frames | 0) + 1;
   const now = performance.now();
-  let dt = (now - last) / 1000; if (dt > 0.05) dt = 0.05;
+  const frameMs = now - last;
+  let dt = frameMs / 1000; if (dt > 0.05) dt = 0.05;
   last = now;
+  QUALITY.sample(frameMs, now);
   if (window.__portal) window.__portal.simT = (window.__portal.simT || 0) + dt;
 
   sizeWorld();
@@ -937,6 +1020,8 @@ function frame() {
   drawVideo();
 
   let target = mouseCorners() || rawCorners;
+  // bench-only: the probe can drive the quad directly (?tune on localhost)
+  if (!target && window.__portal && window.__portal.bench) target = window.__portal.bench;
   let source = target ? "hand" : "";
   if (!target) { target = previewCorners(); if (target) source = "preview"; }
   if (target) {
@@ -981,14 +1066,13 @@ function frame() {
     const c = corners;
     const scale = Math.sqrt(quadArea(c));
 
-    ctx.save();
-    quadPath(c);
-    ctx.clip();
-
     // How open the portal is decides its SIZE, not its opacity. The only fade
     // is a hair's width either side of sealed, so it does not pop into being.
     const alpha = params.opacity * smoothstep(0, 0.12, openAmt);
 
+    ctx.save();
+    quadPath(c);
+    ctx.clip();
     // the void behind the membrane — never flat black, so it reads as depth
     const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(scale, 1));
     g.addColorStop(0, "rgba(9,14,26,1)");
@@ -997,7 +1081,6 @@ function frame() {
     ctx.fillStyle = g;
     quadPath(c); ctx.fill();
     ctx.globalAlpha = 1;
-
     FLOCK.draw({
       c, sx: WORLD / dims.qw, sy: WORLD / dims.qh,
       cx, cy, ca, sa, warp: params.warp

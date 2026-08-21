@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cloth</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #05060a; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #gl { position: fixed; left: 0; top: 0; pointer-events: none; z-index: 5; }
+  video { display: none; }
+  /* tuning panels — only injected when the URL has ?tune, and only on localhost */
+  #panels {
+    position: fixed; top: 16px; right: 16px; z-index: 20;
+    display: flex; flex-direction: column; gap: 10px; align-items: flex-end;
+    max-height: 94vh; overflow-y: auto;
+  }
+  .panel {
+    width: 236px;
+    background: rgba(8,16,20,0.72); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    border: 1px solid rgba(120,200,220,0.18); border-radius: 10px;
+    padding: 10px 12px; font: 11px monospace; color: rgba(200,235,245,0.85);
+    cursor: auto; user-select: none;
+  }
+  .panel.collapsed .row, .panel.collapsed .panel-foot { display: none; }
+  .panel h3 {
+    font-size: 11px; letter-spacing: 1px; font-weight: normal; margin: 0 0 6px;
+    color: rgba(160,220,235,0.7); display: flex; justify-content: space-between; cursor: pointer;
+  }
+  .panel .row { margin: 7px 0; }
+  .panel .row label { display: flex; justify-content: space-between; margin-bottom: 2px; color: rgba(190,225,235,0.65); }
+  .panel .row label span { color: rgba(150,235,210,0.95); }
+  .panel input[type=range] { width: 100%; height: 14px; accent-color: #5fd8c8; cursor: pointer; }
+  .panel input[type=color] {
+    width: 100%; height: 22px; padding: 0; cursor: pointer;
+    background: none; border: 1px solid rgba(120,200,220,0.25); border-radius: 4px;
+  }
+  .panel input[type=color]::-webkit-color-swatch-wrapper { padding: 2px; }
+  .panel input[type=color]::-webkit-color-swatch { border: none; border-radius: 2px; }
+  .panel-foot { margin-top: 10px; display: flex; gap: 8px; }
+  .panel-foot button {
+    flex: 1; background: rgba(95,216,200,0.12); color: rgba(180,235,225,0.9);
+    border: 1px solid rgba(120,200,220,0.25); border-radius: 6px; padding: 5px; font: 10px monospace; cursor: pointer;
+  }
+  .panel-foot button:hover { background: rgba(95,216,200,0.22); }
+
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="stage"></canvas>
+<canvas id="gl"></canvas>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.184.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import { HandLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18";
+import * as THREE from "three";
+
+// ---------------------------------------------------------------------------
+// CLOTH — a sheet of fabric held between your two hands. The thumb tip and
+// index tip of each hand are its four corners: your fingertips are pegs, and
+// the cloth does what cloth does between them - hangs from the top edge,
+// swings after you, folds when you bring your hands together, pulls taut when
+// you spread them. It is not contained by anything; it goes where it goes.
+// ---------------------------------------------------------------------------
+
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+const videoEl = document.getElementById("cam");
+
+let W = 0, H = 0, DPR = 1;
+let qScale = 1;      // the quality governor's dial; see QUALITY below
+let glReady = false; // the GL layer is built further down; resize must not reach for it early
+function resize() {
+  DPR = Math.max(0.6, Math.min(window.devicePixelRatio || 1, 2) * qScale);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (glReady) sizeGL();
+}
+resize();
+window.addEventListener("resize", resize);
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+// ---------------------------------------------------------------------------
+// Tunables. defaults.json is the source of truth and overrides these for
+// everyone; the ?tune panels write straight back to it through tune-server, so
+// a value is saved the moment you drag it. Locked to localhost, so the
+// deployed site can never show the tuner.
+// ---------------------------------------------------------------------------
+const DEFAULTS = {
+  minCutoff: 1.4, beta: 0.010,      // One Euro smoothing on the fingertips
+  worldScale: 1.0,                  // the sheet's world, in screen pixels
+
+  // the sheet
+  cRest: 0.7,        // its natural width, as a fraction of the world; hold it narrower and it folds
+  cGrav: 2.5,        // gravity, world units per second^2 - how much it hangs
+  cDamp: 2.5,        // air drag, per second
+  cSteps: 8,         // XPBD substeps per frame (8 keeps the sim ahead of the display; more is stiffer but slower)
+  cStiff: 0.5,       // bending stiffness: 1 crisp folds, 0 limp
+  cGive: 0.5,        // stretch: 0 crisp, 1 stretchy
+  cShear: 80,        // how much more easily it shears than stretches (drape)
+  cThick: 1.4,       // thickness for self-collision, in grid spacings. Below ~1.2 a fold slips
+                     // BETWEEN the particles - they stay legally apart while the surfaces pass
+                     // through each other - so this is the one dial not to turn down for speed.
+  cFriction: 0.15,   // how much touching folds drag on each other
+  cCrease: 0.3,      // occlusion gathered into the creases
+
+  // the fabric
+  cVelvet: 0.85,     // 0 linen (colour in the base), 1 velvet (colour in the sheen)
+  cSheen: 1.0,       // strength of the fuzz lobe
+  cSheenRough: 0.4,  // width of the fuzz lobe
+  cRough: 0.85,      // base roughness
+  cWeave: 0.6,       // depth of the woven normal map
+  cThreads: 70,      // threads across the sheet
+  cSheer: 0.0,       // 0 opaque, towards 1 a veil
+  cKey: 2.6,         // key light
+  cRim: 1.6,         // cool rim light from behind
+  cAmbient: 0.45,    // the room's light
+  cColor: "#8d6b57"
+};
+
+const IS_LOCAL = ["localhost", "127.0.0.1", "::1", ""].includes(location.hostname);
+const TUNING = IS_LOCAL && new URLSearchParams(location.search).has("tune");
+
+const params = Object.assign({}, DEFAULTS);
+try { Object.assign(params, await (await fetch("./defaults.json", { cache: "no-store" })).json()); } catch (e) {}
+
+let _saveTimer = 0;
+const saveParams = () => {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    fetch("/__tune?to=cloth/defaults.json", { method: "POST", body: JSON.stringify(params, null, 2) }).catch(() => {});
+  }, 400);
+};
+
+const QUALITY = (() => {
+  // A short window, so it answers within a second even on a machine that is
+  // only managing ten frames of it.
+  const RING = 45;
+  const times = new Float32Array(RING), sorted = new Float32Array(RING);
+  let n = 0, filled = 0, badRuns = 0, goodRuns = 0, lastCheck = 0;
+  // The display's own pace, estimated robustly: a low percentile of a long
+  // history (one stray fast frame must not set an impossible target), snapped
+  // to the refresh rates that actually exist. On a machine that cannot keep
+  // up, the history is slow at first, the target is lenient, and as the
+  // resolution comes down the history speeds up and the target tightens -
+  // so it converges on the best pace that machine can actually hold.
+  const LONG = 300;
+  const longRing = new Float32Array(LONG), longSorted = new Float32Array(LONG);
+  let ln = 0, lfilled = 0;
+  const RATES = [1000 / 240, 1000 / 120, 1000 / 90, 1000 / 60, 1000 / 50, 1000 / 30];
+  const FLOOR = 0.45;               // below this the picture is too soft to be worth it
+  const STEP = 0.15;
+  function pct(p) {
+    sorted.set(times.subarray(0, filled)); const a = sorted.subarray(0, filled);
+    Array.prototype.sort.call(a, (x, y) => x - y);
+    return a[Math.min(filled - 1, Math.max(0, Math.round(p * (filled - 1))))];
+  }
+  function refreshMs() {
+    if (lfilled < 30) return 1000 / 60;
+    longSorted.set(longRing.subarray(0, lfilled)); const a = longSorted.subarray(0, lfilled);
+    Array.prototype.sort.call(a, (x, y) => x - y);
+    const p20 = a[Math.round(0.2 * (lfilled - 1))];
+    for (const r of RATES) if (r >= p20 * 0.85) return r;
+    return RATES[RATES.length - 1];
+  }
+  const budgetMs = () => refreshMs() * 1.35;
+  return {
+    scale: () => qScale,
+    // the cloth's substeps ride the same dial, so a slow machine spends less
+    // on the simulation as well as on pixels
+    substeps: () => Math.max(4, Math.round(params.cSteps * qScale)),
+    sample(dtMs, now) {
+      longRing[ln] = dtMs; ln = (ln + 1) % LONG; if (lfilled < LONG) lfilled++;
+      times[n] = dtMs; n = (n + 1) % RING; if (filled < RING) filled++;
+      if (filled < 20 || now - lastCheck < 700) return;
+      lastCheck = now;
+      const med = pct(0.5), budget = budgetMs();
+      if (med > budget) { badRuns++; goodRuns = 0; }
+      else if (med < budget * 0.8) { goodRuns++; badRuns = 0; }
+      else { badRuns = 0; goodRuns = 0; }
+      let changed = false;
+      if (badRuns >= 2 && qScale > FLOOR) {
+        // a machine that is missing by miles gets there in one move
+        const jump = med > budget * 2.5 ? STEP * 2 : STEP;
+        qScale = Math.max(FLOOR, qScale - jump); badRuns = 0; changed = true;
+      } else if (goodRuns >= 5 && qScale < 1) {
+        qScale = Math.min(1, qScale + STEP); goodRuns = 0; changed = true;
+      }
+      if (changed) { filled = 0; n = 0; resize(); syncQuality(); }   // long history kept: it is the record of what this machine can do
+    },
+    report: () => ({ scale: +qScale.toFixed(2), budgetMs: +budgetMs().toFixed(1), medianMs: filled ? +pct(0.5).toFixed(1) : 0 })
+  };
+})();
+let syncQuality = () => {};
+
+
+// ---- One Euro filter ------------------------------------------------------
+// Smooths hard when a fingertip is still, eases off when it moves fast. One
+// instance per corner axis so a fast hand does not drag the other corners.
+const DCUTOFF = 1.0;
+function makeEuro() {
+  let x = null, dx = 0, t = 0;
+  const alpha = (cut, dt) => { const tau = 1 / (2 * Math.PI * cut); return 1 / (1 + tau / dt); };
+  return {
+    reset() { x = null; dx = 0; },
+    filter(v, tMs) {
+      if (x === null) { x = v; t = tMs; return v; }
+      let dt = (tMs - t) / 1000; if (dt <= 0) dt = 1 / 60;
+      t = tMs;
+      const d = (v - x) / dt;
+      dx += alpha(DCUTOFF, dt) * (d - dx);
+      const cut = params.minCutoff + params.beta * Math.abs(dx);
+      x += alpha(cut, dt) * (v - x);
+      return x;
+    }
+  };
+}
+const euro = [0, 1, 2, 3].map(() => ({ x: makeEuro(), y: makeEuro() }));
+function euroResetAll() { for (const e of euro) { e.x.reset(); e.y.reset(); } }
+
+
+// ---------------------------------------------------------------------------
+// Hand tracking
+// ---------------------------------------------------------------------------
+const THUMB_TIP = 4, INDEX_TIP = 8;
+let handLandmarker = null, videoReady = false, lastDetect = 0;
+let rawCorners = null, corners = null, hadHands = false;
+
+async function start() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: "user" }
+    });
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    videoReady = true;
+  } catch (e) {
+    console.warn("portal: no camera — drag with the mouse to hold a portal open");
+    return;
+  }
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO", numHands: 2,
+      minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
+    });
+  } catch (e) {
+    console.warn("portal: hand tracking failed to load", e);
+  }
+}
+start();
+
+// Video is drawn mirrored and fitted whole — contain, not cover, so nothing is
+// cropped and the feed never reads as zoomed in. Landmarks use the same map.
+function videoFit() {
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  if (!vw) return null;
+  const s = Math.min(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s;
+  return { dw, dh, dx: (W - dw) / 2, dy: (H - dh) / 2 };
+}
+function lmToScreen(lm, fit) {
+  return { x: W - (fit.dx + lm.x * fit.dw), y: fit.dy + lm.y * fit.dh };
+}
+
+// Build the quad from two hands. The hand further left on screen owns the left
+// edge; within each hand the corners are bound to the fingers themselves —
+// index fingers take the top edge, thumbs the bottom — and are never re-sorted
+// into a tidy shape. Flip a hand over and that side's edge crosses the other,
+// so the quad folds into an hourglass instead of staying a straight polygon.
+function readCorners(hands, fit) {
+  if (hands.length < 2) return null;
+  const sides = hands.slice(0, 2).map(lm => {
+    const thumb = lmToScreen(lm[THUMB_TIP], fit);
+    const index = lmToScreen(lm[INDEX_TIP], fit);
+    return { thumb, index, midX: (thumb.x + index.x) / 2 };
+  });
+  sides.sort((p, q) => p.midX - q.midX);
+  const L = sides[0], R = sides[1];
+  return [L.index, R.index, R.thumb, L.thumb];
+}
+
+function detectHands() {
+  if (!handLandmarker || !videoReady) return;
+  const now = performance.now();
+  if (now - lastDetect < 33) return;
+  lastDetect = now;
+  const fit = videoFit();
+  if (!fit) return;
+  let res;
+  try { res = handLandmarker.detectForVideo(videoEl, now); } catch (e) { return; }
+  rawCorners = readCorners((res && res.landmarks) || [], fit);
+}
+
+
+// ---- mouse fallback: drag a diagonal to hold a rectangle open --------------
+let mouseDown = false, mouseA = null, mouseB = null;
+canvas.addEventListener("mousedown", e => { mouseDown = true; mouseA = { x: e.clientX, y: e.clientY }; mouseB = { x: e.clientX, y: e.clientY }; });
+window.addEventListener("mousemove", e => { if (mouseDown) mouseB = { x: e.clientX, y: e.clientY }; });
+window.addEventListener("mouseup", () => { mouseDown = false; });
+function mouseCorners() {
+  if (!mouseDown || !mouseA || !mouseB) return null;
+  const x0 = Math.min(mouseA.x, mouseB.x), x1 = Math.max(mouseA.x, mouseB.x);
+  const y0 = Math.min(mouseA.y, mouseB.y), y1 = Math.max(mouseA.y, mouseB.y);
+  return [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
+}
+
+
+// ---- TEMPORARY: a parked sheet in the middle so the fabric can be tuned
+// without holding both hands up. Tuning-only, and hands or a mouse drag always
+// take priority over it. Toggle with p.
+let PREVIEW = TUNING;
+function previewCorners() {
+  if (!PREVIEW) return null;
+  const w = Math.min(520, W * 0.42), h = w * 0.72;
+  const cx = W / 2, cy = H * 0.42;
+  return [{ x: cx - w / 2, y: cy - h / 2 }, { x: cx + w / 2, y: cy - h / 2 },
+          { x: cx + w / 2, y: cy + h / 2 }, { x: cx - w / 2, y: cy + h / 2 }];
+}
+
+// The sheet's own size in screen pixels. Set from the viewport, never from the
+// hands - that is what keeps the fabric's scale fixed while you move.
+let WORLD = 900;
+function sizeWorld() { WORLD = Math.min(W, H) * params.worldScale; }
+
+// ---------------------------------------------------------------------------
+// The GL layer — a transparent three.js canvas over the 2D stage. The 2D
+// canvas keeps the camera feed; this one holds the lit sheet.
+// ---------------------------------------------------------------------------
+const glCanvas = document.getElementById("gl");
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, alpha: true, antialias: true, premultipliedAlpha: true });
+renderer.setClearColor(0x000000, 0);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+function sizeGL() { renderer.setPixelRatio(DPR); renderer.setSize(W, H, false); }
+glReady = true;
+sizeGL();
+
+function clothWorkerMain() {
+  const CW = 52, CH = 40, NN = CW * CH;
+  const pos = new Float32Array(NN * 3), prev = new Float32Array(NN * 3), vel = new Float32Array(NN * 3);
+  const invM = new Float32Array(NN).fill(1);
+  const pins = [0, CW - 1, NN - 1, NN - CW];
+  for (const n of pins) invM[n] = 0;
+  const stretch = [], bend = [];
+  for (let j = 0; j < CH; j++) for (let i = 0; i < CW; i++) {
+    const n = j * CW + i;
+    if (i < CW - 1) stretch.push([n, n + 1, 0]);
+    if (j < CH - 1) stretch.push([n, n + CW, 1]);
+    if (i < CW - 1 && j < CH - 1) { stretch.push([n, n + CW + 1, 2]); stretch.push([n + 1, n + CW, 2]); }
+    if (i < CW - 2) bend.push([n, n + 2, 0]);
+    if (j < CH - 2) bend.push([n, n + 2 * CW, 1]);
+  }
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  const rnd = (a, b) => a + Math.random() * (b - a);
+
+  // self-collision: spatial hash, neighbour lists once per step
+  const HASH = 4096;
+  const cellStart = new Int32Array(HASH + 1), cellEntries = new Int32Array(NN), cellCount = new Int32Array(HASH);
+  const restU0 = new Float32Array(NN), restV0 = new Float32Array(NN);
+  for (let j = 0; j < CH; j++) for (let i = 0; i < CW; i++) { restU0[j * CW + i] = i; restV0[j * CW + i] = j; }
+  const nbrStart = new Int32Array(NN + 1); let nbrs = new Int32Array(NN * 32), nbrCount = 0;
+  const hc = (x, sp) => Math.floor(x / sp);
+  const hi = (xi, yi, zi) => (Math.abs((xi * 92837111) ^ (yi * 689287499) ^ (zi * 283923481)) % HASH);
+  function gather(maxDist) {
+    // one cell per query radius: the box is always 3x3x3, whatever the speed
+    const spacing = maxDist;
+    cellCount.fill(0);
+    for (let n = 0; n < NN; n++) cellCount[hi(hc(pos[n * 3], spacing), hc(pos[n * 3 + 1], spacing), hc(pos[n * 3 + 2], spacing))]++;
+    let start = 0;
+    for (let k = 0; k < HASH; k++) { start += cellCount[k]; cellStart[k] = start; }
+    cellStart[HASH] = start;
+    for (let n = 0; n < NN; n++) { const k = hi(hc(pos[n * 3], spacing), hc(pos[n * 3 + 1], spacing), hc(pos[n * 3 + 2], spacing)); cellStart[k]--; cellEntries[cellStart[k]] = n; }
+    const md2 = maxDist * maxDist; nbrCount = 0;
+    for (let n = 0; n < NN; n++) {
+      nbrStart[n] = nbrCount;
+      const px = pos[n * 3], py = pos[n * 3 + 1], pz = pos[n * 3 + 2];
+      const x0 = hc(px - maxDist, spacing), y0 = hc(py - maxDist, spacing), z0 = hc(pz - maxDist, spacing);
+      const x1 = hc(px + maxDist, spacing), y1 = hc(py + maxDist, spacing), z1 = hc(pz + maxDist, spacing);
+      for (let xi = x0; xi <= x1; xi++) for (let yi = y0; yi <= y1; yi++) for (let zi = z0; zi <= z1; zi++) {
+        const k = hi(xi, yi, zi);
+        for (let e = cellStart[k]; e < cellStart[k + 1]; e++) {
+          const m = cellEntries[e]; if (m <= n) continue;
+          const du = restU0[m] - restU0[n], dv = restV0[m] - restV0[n];
+          if (du * du + dv * dv < 6.5) continue;
+          const dx = pos[m * 3] - px, dy = pos[m * 3 + 1] - py, dz = pos[m * 3 + 2] - pz;
+          if (dx * dx + dy * dy + dz * dz > md2) continue;
+          if (nbrCount >= nbrs.length) { const bigger = new Int32Array(nbrs.length * 2); bigger.set(nbrs); nbrs = bigger; }
+          nbrs[nbrCount++] = m;
+        }
+      }
+    }
+    nbrStart[NN] = nbrCount;
+  }
+  function solveSelf(th, friction) {
+    const t2 = th * th;
+    for (let n = 0; n < NN; n++) {
+      const wa = invM[n];
+      for (let e = nbrStart[n]; e < nbrStart[n + 1]; e++) {
+        const m = nbrs[e]; const wb = invM[m]; const ws = wa + wb; if (!ws) continue;
+        const ax = pos[n * 3], ay = pos[n * 3 + 1], az = pos[n * 3 + 2];
+        const dx = pos[m * 3] - ax, dy = pos[m * 3 + 1] - ay, dz = pos[m * 3 + 2] - az;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 >= t2 || d2 < 1e-9) continue;
+        const d = Math.sqrt(d2), C = d - th, s = -C / ws, gx = dx / d, gy = dy / d, gz = dz / d;
+        pos[n * 3] -= gx * s * wa; pos[n * 3 + 1] -= gy * s * wa; pos[n * 3 + 2] -= gz * s * wa;
+        pos[m * 3] += gx * s * wb; pos[m * 3 + 1] += gy * s * wb; pos[m * 3 + 2] += gz * s * wb;
+        if (friction > 0) {
+          const vax = pos[n * 3] - prev[n * 3], vay = pos[n * 3 + 1] - prev[n * 3 + 1], vaz = pos[n * 3 + 2] - prev[n * 3 + 2];
+          const vbx = pos[m * 3] - prev[m * 3], vby = pos[m * 3 + 1] - prev[m * 3 + 1], vbz = pos[m * 3 + 2] - prev[m * 3 + 2];
+          const avx = (vax + vbx) * 0.5, avy = (vay + vby) * 0.5, avz = (vaz + vbz) * 0.5;
+          if (wa) { pos[n * 3] += (avx - vax) * friction; pos[n * 3 + 1] += (avy - vay) * friction; pos[n * 3 + 2] += (avz - vaz) * friction; }
+          if (wb) { pos[m * 3] += (avx - vbx) * friction; pos[m * 3 + 1] += (avy - vby) * friction; pos[m * 3 + 2] += (avz - vbz) * friction; }
+        }
+      }
+    }
+  }
+  function solve(list, rU, rV, rD, alpha, alphaDiag) {
+    for (let q = 0; q < list.length; q++) {
+      const cn = list[q], a = cn[0], b = cn[1], kind = cn[2];
+      const wa = invM[a], wb = invM[b], ws = wa + wb; if (ws === 0) continue;
+      const rest = kind === 0 ? rU : kind === 1 ? rV : rD, al = kind === 2 ? alphaDiag : alpha;
+      const ax = pos[a * 3], ay = pos[a * 3 + 1], az = pos[a * 3 + 2];
+      const dx = pos[b * 3] - ax, dy = pos[b * 3 + 1] - ay, dz = pos[b * 3 + 2] - az;
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz); if (len < 1e-6) continue;
+      const s = -(len - rest) / (ws + al), gx = dx / len, gy = dy / len, gz = dz / len;
+      pos[a * 3] -= gx * s * wa; pos[a * 3 + 1] -= gy * s * wa; pos[a * 3 + 2] -= gz * s * wa;
+      pos[b * 3] += gx * s * wb; pos[b * 3 + 1] += gy * s * wb; pos[b * 3 + 2] += gz * s * wb;
+    }
+  }
+
+  let ready = false, settleT = 0;
+  const born = [[0, 0], [0, 0], [0, 0], [0, 0]], pinFrom = [[0, 0], [0, 0], [0, 0], [0, 0]], pinTo = [[0, 0], [0, 0], [0, 0], [0, 0]];
+  const tone = new Float32Array(NN);
+  for (let j = 0; j < CH; j++) for (let i = 0; i < CW; i++) {
+    const u = i / CW * 6.3, v = j / CH * 6.3;
+    tone[j * CW + i] = 0.94 + 0.06 * (0.5 + 0.5 * Math.sin(u * 1.7 + 0.3) * Math.cos(v * 1.3 + 1.1)) + rnd(-0.015, 0.015);
+  }
+  const ao = new Float32Array(NN);
+
+  function place(c, P) {
+    const restW = P.cRest * P.WORLD, restH = restW * 0.75;
+    const cx = (c[0] + c[2] + c[4] + c[6]) / 4, cy = (c[1] + c[3] + c[5] + c[7]) / 4;
+    const su = restW / (CW - 1);
+    for (let j = 0; j < CH; j++) for (let i = 0; i < CW; i++) {
+      const n = j * CW + i;
+      pos[n * 3] = cx - restW / 2 + i / (CW - 1) * restW;
+      pos[n * 3 + 1] = -(cy - restH / 2 + j / (CH - 1) * restH);
+      pos[n * 3 + 2] = su * (0.6 * Math.sin(Math.PI * i / (CW - 1)) * Math.sin(Math.PI * j / (CH - 1)) + rnd(-0.02, 0.02));
+      prev[n * 3] = pos[n * 3]; prev[n * 3 + 1] = pos[n * 3 + 1]; prev[n * 3 + 2] = pos[n * 3 + 2];
+    }
+    vel.fill(0);
+    for (let k = 0; k < 4; k++) { const n = pins[k]; born[k] = [pos[n * 3], pos[n * 3 + 1]]; pinTo[k] = born[k].slice(); pinFrom[k] = born[k].slice(); }
+    settleT = 0; ready = true;
+  }
+
+  function step(dt, c, P) {
+    if (!ready) place(c, P);
+    settleT += dt;
+    const grab = smoothstep(0, 0.7, settleT);
+    for (let k = 0; k < 4; k++) {
+      pinFrom[k] = pinTo[k];
+      pinTo[k] = [born[k][0] + (c[k * 2] - born[k][0]) * grab, born[k][1] + (-c[k * 2 + 1] - born[k][1]) * grab];
+    }
+    const restW = P.cRest * P.WORLD, restH = restW * 0.75;
+    const su = restW / (CW - 1), sv = restH / (CH - 1), sd = Math.hypot(su, sv);
+    const g = P.cGrav * P.WORLD;
+    const steps = Math.max(1, P.cSteps | 0), sdt = dt / steps;
+    const compliance = 1e-6 * Math.pow(10, 3 * (1 - clamp(P.cStiff, 0, 1)));
+    const alphaBend = compliance / (sdt * sdt);
+    const alphaStretch = 1e-7 * Math.pow(10, 2 * clamp(P.cGive, 0, 1)) / (sdt * sdt);
+    const drag = Math.max(0, 1 - P.cDamp * sdt);
+    const th = su * P.cThick;
+    // Nothing may move more than half its own thickness in one substep - that
+    // is what makes self-collision reliable, since a pair can never swap sides
+    // between two solves. It is not a number of its own: it falls out of the
+    // thickness and the substep, so changing either keeps it honest. Without
+    // self-collision there is nothing to tunnel through, so the limit is loose.
+    const vMax = P.cThick > 0.01 ? 0.5 * th / sdt : 6 * P.WORLD;
+    if (P.cThick > 0.01) {
+      // the neighbour lists must cover everything that could come within a
+      // thickness before the next gather - which is one frame of travel at
+      // that speed limit. Cheap when the cloth is settled, wider while it flies.
+      let maxV = 0; for (let n = 0; n < NN; n++) { const o = n * 3; const sp = vel[o] * vel[o] + vel[o + 1] * vel[o + 1] + vel[o + 2] * vel[o + 2]; if (sp > maxV) maxV = sp; }
+      gather(th + Math.min(Math.sqrt(maxV), vMax) * dt);
+    }
+    for (let s = 0; s < steps; s++) {
+      const f = (s + 1) / steps;
+      for (let n = 0; n < NN; n++) {
+        if (invM[n] === 0) continue;
+        const o = n * 3;
+        vel[o + 1] -= g * sdt;
+        vel[o] *= drag; vel[o + 1] *= drag; vel[o + 2] *= drag;
+        prev[o] = pos[o]; prev[o + 1] = pos[o + 1]; prev[o + 2] = pos[o + 2];
+        pos[o] += vel[o] * sdt; pos[o + 1] += vel[o + 1] * sdt; pos[o + 2] += vel[o + 2] * sdt;
+      }
+      for (let k = 0; k < 4; k++) {
+        const o = pins[k] * 3;
+        const tx = pinFrom[k][0] + (pinTo[k][0] - pinFrom[k][0]) * f, ty = pinFrom[k][1] + (pinTo[k][1] - pinFrom[k][1]) * f;
+        let dx = tx - pos[o], dy = ty - pos[o + 1], dz = -pos[o + 2];
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz), lim = vMax * sdt;
+        if (d > lim) { const k2 = lim / d; dx *= k2; dy *= k2; dz *= k2; }
+        pos[o] += dx; pos[o + 1] += dy; pos[o + 2] += dz;
+      }
+      solve(stretch, su, sv, sd, alphaStretch, alphaStretch * P.cShear);
+      solve(bend, 2 * su, 2 * sv, 0, alphaBend, alphaBend);
+      if (P.cThick > 0.01) solveSelf(th, P.cFriction);
+      for (let n = 0; n < NN; n++) {
+        if (invM[n] === 0) continue;
+        const o = n * 3;
+        let vx = (pos[o] - prev[o]) / sdt, vy = (pos[o + 1] - prev[o + 1]) / sdt, vz = (pos[o + 2] - prev[o + 2]) / sdt;
+        const sp = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        if (sp > vMax) { const k = vMax / sp; vx *= k; vy *= k; vz *= k; }
+        vel[o] = vx; vel[o + 1] = vy; vel[o + 2] = vz;
+      }
+    }
+    // crease occlusion: curvature along the grid against a cheap normal
+    for (let j = 0; j < CH; j++) for (let i = 0; i < CW; i++) {
+      const n = j * CW + i, o = n * 3;
+      const ia = i > 0 ? n - 1 : n, ib = i < CW - 1 ? n + 1 : n, ja = j > 0 ? n - CW : n, jb = j < CH - 1 ? n + CW : n;
+      const tx = pos[ib * 3] - pos[ia * 3], ty = pos[ib * 3 + 1] - pos[ia * 3 + 1], tz = pos[ib * 3 + 2] - pos[ia * 3 + 2];
+      const ux = pos[jb * 3] - pos[ja * 3], uy = pos[jb * 3 + 1] - pos[ja * 3 + 1], uz = pos[jb * 3 + 2] - pos[ja * 3 + 2];
+      let nx = ty * uz - tz * uy, ny = tz * ux - tx * uz, nz = tx * uy - ty * ux; const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+      const lx = (pos[ia * 3] + pos[ib * 3] + pos[ja * 3] + pos[jb * 3]) / 4 - pos[o];
+      const ly = (pos[ia * 3 + 1] + pos[ib * 3 + 1] + pos[ja * 3 + 1] + pos[jb * 3 + 1]) / 4 - pos[o + 1];
+      const lz = (pos[ia * 3 + 2] + pos[ib * 3 + 2] + pos[ja * 3 + 2] + pos[jb * 3 + 2]) / 4 - pos[o + 2];
+      const curv = (lx * nx + ly * ny + lz * nz) / su;
+      ao[n] = clamp(1 - Math.abs(curv) * P.cCrease * 2.5, 0.35, 1) * tone[n];
+    }
+  }
+
+  self.onmessage = e => {
+    const m = e.data;
+    if (m.type === "reset") { ready = false; return; }
+    if (m.type === "step") {
+      step(m.dt, m.corners, m.P);
+      const outPos = new Float32Array(pos), outAo = new Float32Array(ao);
+      self.postMessage({ pos: outPos, ao: outAo }, [outPos.buffer, outAo.buffer]);
+    }
+  };
+}
+
+
+const CLOTH = (() => {
+  const CW = 52, CH = 40, NN = CW * CH;
+  const worker = new Worker(URL.createObjectURL(new Blob(["(" + clothWorkerMain.toString() + ")()"], { type: "text/javascript" })));
+  let inFlight = false, have = false, pending = 0;
+  const pos = new Float32Array(NN * 3);
+
+  // ---- scene
+  const scene = new THREE.Scene();
+  const cam = new THREE.PerspectiveCamera(40, 1, 1, 20000);
+  const geo = new THREE.BufferGeometry();
+  const posAttr = new THREE.BufferAttribute(pos, 3);
+  geo.setAttribute("position", posAttr);
+  const uvs = new Float32Array(NN * 2);
+  for (let j = 0; j < CH; j++) for (let i = 0; i < CW; i++) { uvs[(j * CW + i) * 2] = i / (CW - 1); uvs[(j * CW + i) * 2 + 1] = 1 - j / (CH - 1); }
+  geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+  const aoArr = new Float32Array(NN * 3).fill(1);
+  geo.setAttribute("color", new THREE.BufferAttribute(aoArr, 3));
+  const idx = [];
+  for (let j = 0; j < CH - 1; j++) for (let i = 0; i < CW - 1; i++) {
+    const a = j * CW + i, b = a + 1, d = a + CW, e = d + 1;
+    idx.push(a, d, b, b, d, e);
+  }
+  geo.setIndex(idx);
+
+  worker.onmessage = e => {
+    inFlight = false;
+    pos.set(e.data.pos);
+    const ao = e.data.ao;
+    for (let n = 0; n < NN; n++) { aoArr[n * 3] = aoArr[n * 3 + 1] = aoArr[n * 3 + 2] = ao[n]; }
+    posAttr.needsUpdate = true; geo.getAttribute("color").needsUpdate = true;
+    geo.computeVertexNormals();
+    have = true;
+  };
+
+  // woven normal map: warp and weft as half-cylinders, over-under
+  function weaveTexture() {
+    const S = 256, c = document.createElement("canvas"); c.width = c.height = S;
+    const g = c.getContext("2d"); const img = g.createImageData(S, S); const d = img.data;
+    const th = 16;
+    const hgt = new Float32Array(S * S);
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      const cx = x / th, cy = y / th;
+      const ix = Math.floor(cx), iy = Math.floor(cy);
+      const fx = cx - ix - 0.5, fy = cy - iy - 0.5;
+      const warpUp = ((ix + iy) & 1) === 0;
+      const warp = Math.sqrt(Math.max(0, 0.25 - fx * fx)) * 2 * (warpUp ? 1 : 0.55) * (0.75 + 0.25 * Math.cos(fy * Math.PI * 2));
+      const weft = Math.sqrt(Math.max(0, 0.25 - fy * fy)) * 2 * (warpUp ? 0.55 : 1) * (0.75 + 0.25 * Math.cos(fx * Math.PI * 2));
+      hgt[y * S + x] = Math.max(warp, weft) + (Math.random() - 0.5) * 0.05;
+    }
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      const l = hgt[y * S + ((x - 1 + S) % S)], r = hgt[y * S + ((x + 1) % S)];
+      const u = hgt[((y - 1 + S) % S) * S + x], dn = hgt[((y + 1) % S) * S + x];
+      let nx = (l - r) * 2.2, ny = (u - dn) * 2.2, nz = 1; const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
+      const o = (y * S + x) * 4; d[o] = (nx * 0.5 + 0.5) * 255; d[o + 1] = (ny * 0.5 + 0.5) * 255; d[o + 2] = (nz * 0.5 + 0.5) * 255; d[o + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 8; return t;
+  }
+  const weaveN = weaveTexture();
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0xb8a58e, roughness: 0.85, metalness: 0,
+    sheen: 1, sheenRoughness: 0.55, sheenColor: new THREE.Color(0xffffff),
+    normalMap: weaveN, normalScale: new THREE.Vector2(0.6, 0.6),
+    side: THREE.DoubleSide, vertexColors: true, transparent: true, opacity: 1
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true; mesh.receiveShadow = true; mesh.frustumCulled = false;
+  scene.add(mesh);
+  const key = new THREE.DirectionalLight(0xffe6c4, 2.2);
+  key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004; key.shadow.normalBias = 2.5;
+  key.shadow.radius = 6;
+  scene.add(key); scene.add(key.target);
+  const rim = new THREE.DirectionalLight(0xb8c8ff, 1.2); scene.add(rim); scene.add(rim.target);
+  const fill = new THREE.DirectionalLight(0xd8d0ff, 0.25); scene.add(fill);
+  (async () => {
+    try {
+      const { RoomEnvironment } = await import("three/addons/environments/RoomEnvironment.js");
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+      scene.environmentIntensity = 0.55;
+    } catch (e) { console.warn("portal: environment failed", e); }
+  })();
+
+  const simKeys = ["cRest", "cGrav", "cSteps", "cStiff", "cGive", "cShear", "cDamp", "cThick", "cFriction", "cCrease"];
+  return {
+    reset() { have = false; worker.postMessage({ type: "reset" }); },
+    positions: () => pos,   // bench instrumentation (last received)
+    dbg: () => ({ mesh, mat, key, rim, scene }),
+    // bench only: how many of the sheet's own edges actually pass through its
+    // own triangles - the only honest measure of interpenetration, since a
+    // fold can slip between particles without any pair of them being close
+    crossings: () => {
+      const tri = geo.getIndex().array, T = tri.length / 3;
+      const su = params.cRest * WORLD / (CW - 1);
+      const cell = su * 2.5, HASH = 8192;
+      const buckets = new Map();
+      const key = (x, y, z) => (((x * 92837111) ^ (y * 689287499) ^ (z * 283923481)) >>> 0) % HASH;
+      const cc = v => Math.floor(v / cell);
+      for (let t = 0; t < T; t++) {
+        const a = tri[t * 3], b = tri[t * 3 + 1], c = tri[t * 3 + 2];
+        let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+        for (const v of [a, b, c]) {
+          const o = v * 3;
+          if (pos[o] < x0) x0 = pos[o]; if (pos[o] > x1) x1 = pos[o];
+          if (pos[o + 1] < y0) y0 = pos[o + 1]; if (pos[o + 1] > y1) y1 = pos[o + 1];
+          if (pos[o + 2] < z0) z0 = pos[o + 2]; if (pos[o + 2] > z1) z1 = pos[o + 2];
+        }
+        for (let xi = cc(x0); xi <= cc(x1); xi++) for (let yi = cc(y0); yi <= cc(y1); yi++) for (let zi = cc(z0); zi <= cc(z1); zi++) {
+          const k = key(xi, yi, zi); let arr = buckets.get(k); if (!arr) buckets.set(k, arr = []); arr.push(t);
+        }
+      }
+      // Moller-Trumbore, for a segment rather than a ray
+      const hit = (p0, p1, a, b, c) => {
+        const ex1 = pos[b * 3] - pos[a * 3], ey1 = pos[b * 3 + 1] - pos[a * 3 + 1], ez1 = pos[b * 3 + 2] - pos[a * 3 + 2];
+        const ex2 = pos[c * 3] - pos[a * 3], ey2 = pos[c * 3 + 1] - pos[a * 3 + 1], ez2 = pos[c * 3 + 2] - pos[a * 3 + 2];
+        const dx = pos[p1 * 3] - pos[p0 * 3], dy = pos[p1 * 3 + 1] - pos[p0 * 3 + 1], dz = pos[p1 * 3 + 2] - pos[p0 * 3 + 2];
+        const hx = dy * ez2 - dz * ey2, hy = dz * ex2 - dx * ez2, hz = dx * ey2 - dy * ex2;
+        const det = ex1 * hx + ey1 * hy + ez1 * hz;
+        if (Math.abs(det) < 1e-9) return false;
+        const inv = 1 / det;
+        const sx = pos[p0 * 3] - pos[a * 3], sy = pos[p0 * 3 + 1] - pos[a * 3 + 1], sz = pos[p0 * 3 + 2] - pos[a * 3 + 2];
+        const u = (sx * hx + sy * hy + sz * hz) * inv;
+        if (u < 0 || u > 1) return false;
+        const qx = sy * ez1 - sz * ey1, qy = sz * ex1 - sx * ez1, qz = sx * ey1 - sy * ex1;
+        const v = (dx * qx + dy * qy + dz * qz) * inv;
+        if (v < 0 || u + v > 1) return false;
+        const tt = (ex2 * qx + ey2 * qy + ez2 * qz) * inv;
+        return tt > 1e-6 && tt < 1 - 1e-6;
+      };
+      let count = 0;
+      const seen = new Set();
+      for (let j = 0; j < CH; j++) for (let i = 0; i < CW; i++) {
+        const n = j * CW + i;
+        for (const m of (i < CW - 1 ? [n + 1] : []).concat(j < CH - 1 ? [n + CW] : [])) {
+          const x0 = Math.min(pos[n * 3], pos[m * 3]), x1 = Math.max(pos[n * 3], pos[m * 3]);
+          const y0 = Math.min(pos[n * 3 + 1], pos[m * 3 + 1]), y1 = Math.max(pos[n * 3 + 1], pos[m * 3 + 1]);
+          const z0 = Math.min(pos[n * 3 + 2], pos[m * 3 + 2]), z1 = Math.max(pos[n * 3 + 2], pos[m * 3 + 2]);
+          seen.clear();
+          for (let xi = cc(x0); xi <= cc(x1); xi++) for (let yi = cc(y0); yi <= cc(y1); yi++) for (let zi = cc(z0); zi <= cc(z1); zi++) {
+            const arr = buckets.get(key(xi, yi, zi)); if (!arr) continue;
+            for (const t of arr) {
+              if (seen.has(t)) continue; seen.add(t);
+              const a = tri[t * 3], b = tri[t * 3 + 1], c = tri[t * 3 + 2];
+              if (a === n || b === n || c === n || a === m || b === m || c === m) continue;
+              if (hit(n, m, a, b, c)) count++;
+            }
+          }
+        }
+      }
+      return count;
+    },
+    // bench only: the deepest interpenetration between parts of the sheet that
+    // are not neighbours in the weave, as a fraction of the collision thickness
+    penetration: () => {
+      const su = params.cRest * WORLD / (CW - 1), th = su * params.cThick;
+      let worst = 0, count = 0;
+      for (let a = 0; a < NN; a++) {
+        const ai = a % CW, aj = (a / CW) | 0;
+        for (let b = a + 1; b < NN; b++) {
+          const du = (b % CW) - ai, dv = ((b / CW) | 0) - aj;
+          if (du * du + dv * dv < 6.5) continue;
+          const dx = pos[b * 3] - pos[a * 3], dy = pos[b * 3 + 1] - pos[a * 3 + 1], dz = pos[b * 3 + 2] - pos[a * 3 + 2];
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 >= th * th) continue;
+          count++;
+          const pen = 1 - Math.sqrt(d2) / th;
+          if (pen > worst) worst = pen;
+        }
+      }
+      return { pairs: count, worst: +worst.toFixed(3), thickness: +th.toFixed(1) };
+    },
+    update(dt, c) {
+      // The worker is asked for one step at a time. A frame that arrives while
+      // it is still busy does not stall and does not lose its time either: the
+      // dt rides along on the next step, so the cloth keeps real time however
+      // fast or slow the sim happens to run.
+      pending += dt;
+      if (!c || inFlight) return;
+      dt = Math.min(pending, 1 / 30); pending = 0;
+      inFlight = true;
+      const P = { WORLD };
+      for (const k of simKeys) P[k] = params[k];
+      P.cSteps = QUALITY.substeps();
+      worker.postMessage({ type: "step", dt, corners: [c[0].x, c[0].y, c[1].x, c[1].y, c[2].x, c[2].y, c[3].x, c[3].y], P });
+    },
+
+    draw(alpha) {
+      if (!have) return;
+      const eyeZ = W * 1.15;
+      cam.fov = 2 * Math.atan((H / 2) / eyeZ) * 180 / Math.PI;
+      cam.aspect = W / H; cam.near = eyeZ * 0.1; cam.far = eyeZ * 4;
+      cam.position.set(W / 2, -H / 2, eyeZ); cam.lookAt(W / 2, -H / 2, 0); cam.updateProjectionMatrix();
+      key.position.set(-W * 0.3, H * 0.6, eyeZ * 0.55); key.target.position.set(W / 2, -H / 2, 0);
+      const sc = key.shadow.camera; const span = Math.max(W, H) * 0.9;
+      sc.left = -span; sc.right = span; sc.top = span; sc.bottom = -span; sc.near = 1; sc.far = eyeZ * 3; sc.updateProjectionMatrix();
+      rim.position.set(W * 1.3, -H * 0.1, -eyeZ * 0.5); rim.target.position.set(W / 2, -H / 2, 0);
+      fill.position.set(W * 0.9, -H * 1.2, eyeZ * 0.6);
+      rim.intensity = params.cRim;
+      const base = hexToRgb(params.cColor);
+      mat.color.setRGB(base[0], base[1], base[2]);
+      const sheenC = params.cVelvet;
+      mat.sheenColor.setRGB(1 - (1 - base[0]) * sheenC, 1 - (1 - base[1]) * sheenC, 1 - (1 - base[2]) * sheenC);
+      mat.color.multiplyScalar(1 - sheenC * 0.7);
+      mat.sheen = params.cSheen; mat.sheenRoughness = params.cSheenRough; mat.roughness = params.cRough;
+      mat.normalScale.set(params.cWeave, params.cWeave);
+      weaveN.repeat.set(params.cThreads, params.cThreads * 0.75);
+      // Opaque cloth must be drawn opaque: a solid sheet that is merely
+      // "almost opaque" writes depth for fragments the eye should never see,
+      // and the far side of a fold punches through the near side. Only a
+      // deliberate veil goes transparent, and then it stops writing depth.
+      const op = alpha * (1 - params.cSheer);
+      if (op > 0.995) { mat.transparent = false; mat.opacity = 1; mat.depthWrite = true; }
+      else { mat.transparent = true; mat.opacity = op; mat.depthWrite = false; }
+      key.intensity = params.cKey; scene.environmentIntensity = params.cAmbient;
+      // shadows cost a whole extra pass; on a machine that is already easing
+      // the resolution down they are the first luxury to drop
+      const wantShadow = QUALITY.scale() > 0.7;
+      if (mesh.castShadow !== wantShadow) { mesh.castShadow = wantShadow; mesh.receiveShadow = wantShadow; key.castShadow = wantShadow; }
+      renderer.render(scene, cam);
+    }
+  };
+})();
+
+
+function hexToRgb(hex) {
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || "");
+  if (!m) return [0.5, 0.5, 0.5];
+  return [parseInt(m[1], 16) / 255, parseInt(m[2], 16) / 255, parseInt(m[3], 16) / 255];
+}
+
+
+if (TUNING) window.__cloth = { params, CLOTH, quality: () => QUALITY.report() };   // bench-only hook
+
+// ---------------------------------------------------------------------------
+// Tuning panels
+// ---------------------------------------------------------------------------
+let syncPanels = () => {};
+
+function buildPanel(title, controls) {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  const fmt = (v, step) => (+v).toFixed(step < 0.01 ? 3 : step < 1 ? 2 : 0);
+  const rows = [];
+
+  const head = document.createElement("h3");
+  const t = document.createElement("span"); t.textContent = title;
+  const tog = document.createElement("span"); tog.textContent = "[hide]";
+  head.appendChild(t); head.appendChild(tog);
+  head.addEventListener("click", () => {
+    panel.classList.toggle("collapsed");
+    tog.textContent = panel.classList.contains("collapsed") ? "[show]" : "[hide]";
+  });
+  panel.appendChild(head);
+
+  for (const c of controls) {
+    const row = document.createElement("div"); row.className = "row";
+    const lab = document.createElement("label");
+    const isColor = c.type === "color";
+    const val = document.createElement("span");
+    val.textContent = isColor ? params[c.key] : fmt(params[c.key], c.step);
+    lab.appendChild(document.createTextNode(c.label)); lab.appendChild(val);
+    const inp = document.createElement("input");
+    if (isColor) {
+      inp.type = "color"; inp.value = params[c.key];
+    } else {
+      inp.type = "range"; inp.min = c.min; inp.max = c.max; inp.step = c.step; inp.value = params[c.key];
+    }
+    inp.addEventListener("input", () => {
+      params[c.key] = isColor ? inp.value : parseFloat(inp.value);
+      val.textContent = isColor ? params[c.key] : fmt(params[c.key], c.step);
+      if (c.rebuild) FLOCK.rebuild();
+      if (c.repalette) buildPalette();
+      saveParams();
+    });
+    rows.push({ c, inp, val, isColor });
+    row.appendChild(lab); row.appendChild(inp);
+    panel.appendChild(row);
+  }
+
+  const foot = document.createElement("div"); foot.className = "panel-foot";
+  const reset = document.createElement("button"); reset.textContent = "reset";
+  reset.addEventListener("click", () => {
+    for (const c of controls) params[c.key] = DEFAULTS[c.key];
+    FLOCK.rebuild(); buildPalette();
+    sync(); saveParams();
+  });
+  foot.appendChild(reset);
+  panel.appendChild(foot);
+
+  function sync() {
+    for (const r of rows) {
+      r.inp.value = params[r.c.key];
+      r.val.textContent = r.isColor ? params[r.c.key] : fmt(params[r.c.key], r.c.step);
+    }
+  }
+  return { panel, sync };
+}
+
+
+if (TUNING) {
+  const wrap = document.createElement("div"); wrap.id = "panels";
+  const qLine = document.createElement("div");
+  qLine.className = "panel";
+  qLine.style.padding = "6px 12px";
+  syncQuality = () => { const q = QUALITY.report(); qLine.textContent = "quality " + q.scale + "  \u00b7  " + q.medianMs + " ms/frame  \u00b7  budget " + q.budgetMs + " ms"; };
+  syncQuality();
+  setInterval(syncQuality, 1000);
+  wrap.appendChild(qLine);
+  const built = [
+    buildPanel("HANDS", [
+      { key: "minCutoff", label: "smooth at rest", min: 0.1, max: 5, step: 0.05 },
+      { key: "beta", label: "snap when moving", min: 0, max: 0.05, step: 0.001 },
+      { key: "worldScale", label: "world scale", min: 0.4, max: 2.5, step: 0.01 }
+    ]),
+    buildPanel("SHEET", [
+      { key: "cRest", label: "natural width", min: 0.1, max: 1.5, step: 0.01 },
+      { key: "cGrav", label: "gravity (hang)", min: 0, max: 12, step: 0.1 },
+      { key: "cDamp", label: "air drag", min: 0, max: 8, step: 0.05 },
+      { key: "cStiff", label: "fold stiffness", min: 0, max: 1, step: 0.01 },
+      { key: "cGive", label: "stretch give", min: 0, max: 1, step: 0.01 },
+      { key: "cShear", label: "shear ease (drape)", min: 1, max: 400, step: 1 },
+      { key: "cThick", label: "thickness (>1.2 or it slips)", min: 0, max: 3, step: 0.05 },
+      { key: "cFriction", label: "fold friction", min: 0, max: 1, step: 0.02 },
+      { key: "cSteps", label: "substeps", min: 2, max: 30, step: 1 },
+      { key: "cCrease", label: "crease shadow", min: 0, max: 2, step: 0.05 }
+    ]),
+    buildPanel("FABRIC", [
+      { key: "cColor", label: "colour", type: "color" },
+      { key: "cVelvet", label: "linen <-> velvet", min: 0, max: 1, step: 0.01 },
+      { key: "cSheer", label: "opaque <-> veil", min: 0, max: 0.9, step: 0.01 },
+      { key: "cSheen", label: "sheen", min: 0, max: 1, step: 0.01 },
+      { key: "cSheenRough", label: "sheen width", min: 0.05, max: 1, step: 0.01 },
+      { key: "cRough", label: "roughness", min: 0.2, max: 1, step: 0.01 },
+      { key: "cWeave", label: "weave depth", min: 0, max: 2, step: 0.05 },
+      { key: "cThreads", label: "threads", min: 6, max: 120, step: 1 },
+      { key: "cKey", label: "key light", min: 0, max: 6, step: 0.1 },
+      { key: "cRim", label: "rim light", min: 0, max: 4, step: 0.1 },
+      { key: "cAmbient", label: "room light", min: 0, max: 2, step: 0.05 }
+    ])
+  ];
+  for (const x of built) wrap.appendChild(x.panel);
+  document.body.appendChild(wrap);
+  syncPanels = () => { for (const x of built) x.sync(); };
+}
+
+window.addEventListener("keydown", e => {
+  if (e.key === "p" && TUNING) PREVIEW = !PREVIEW;
+});
+
+// ---------------------------------------------------------------------------
+// Frame
+// ---------------------------------------------------------------------------
+let last = performance.now();
+let lastSource = "";
+let presence = 0;   // hadHands/corners are declared with the tracking above     // fades the sheet in when your hands arrive, out when they leave
+
+function drawVideo() {
+  ctx.fillStyle = "#05060a";
+  ctx.fillRect(0, 0, W, H);
+  const fit = videoFit();
+  if (!fit) return;
+  ctx.save();
+  ctx.translate(W, 0); ctx.scale(-1, 1);
+  ctx.drawImage(videoEl, fit.dx, fit.dy, fit.dw, fit.dh);
+  ctx.restore();
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  const frameMs = now - last;
+  let dt = frameMs / 1000; if (dt > 0.05) dt = 0.05;
+  last = now;
+  QUALITY.sample(frameMs, now);
+  if (window.__cloth) window.__cloth.frames = (window.__cloth.frames | 0) + 1;
+
+  sizeWorld();
+  detectHands();
+  drawVideo();
+
+  let target = mouseCorners() || rawCorners;
+  let source = target ? "hand" : "";
+  if (!target && window.__cloth && window.__cloth.bench) { target = window.__cloth.bench; source = "bench"; }
+  if (!target) { target = previewCorners(); if (target) source = "preview"; }
+  if (target) {
+    if (!hadHands || source !== lastSource) { euroResetAll(); corners = target.map(p => ({ x: p.x, y: p.y })); }
+    hadHands = true;
+    corners = target.map((p, i) => ({ x: euro[i].x.filter(p.x, now), y: euro[i].y.filter(p.y, now) }));
+  } else {
+    hadHands = false;
+  }
+  lastSource = source;
+
+  presence += ((hadHands ? 1 : 0) - presence) * (1 - Math.pow(0.002, dt));
+
+  CLOTH.update(dt, corners);
+  if (presence > 0.004) CLOTH.draw(presence);
+  else { renderer.setRenderTarget(null); renderer.clear(); }
+
+  if (source === "preview") {
+    ctx.save();
+    ctx.font = "10px monospace";
+    ctx.fillStyle = "rgba(120,200,220,0.45)";
+    ctx.fillText("PREVIEW BENCH \u2014 p to hide", 20, H - 20);
+    ctx.restore();
+  }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
