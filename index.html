@@ -73,19 +73,15 @@
     filter: brightness(1.12);
     transition-duration: var(--hover-on);
   }
-  .piece figcaption,
   .piece .cap {
+    display: block;
     margin-top: 0.6rem;
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 1rem;
+    font-size: 0.95rem;
+    font-weight: 600;
   }
-  .name { font-size: 0.95rem; font-weight: 600; }
   /* a portrait piece in a landscape tile: crop from nearer the top, where
      the drawn figure is, rather than the middle */
   .piece img.tall { object-position: center 22%; }
-  .how { font-size: 0.75rem; color: var(--ink-3); white-space: nowrap; }
 
   footer {
     margin-top: 4rem;
@@ -119,32 +115,32 @@
 
     <a class="piece" href="cloth/">
       <img src="thumbs/cloth.jpg" width="900" height="600" alt="A mint sheet of cloth hanging in the dark, folded by unseen fingertips">
-      <span class="cap"><span class="name">Cloth</span><span class="how">both hands</span></span>
+      <span class="cap">Cloth</span>
     </a>
 
     <a class="piece" href="portal/">
       <img src="thumbs/portal.jpg" width="900" height="600" alt="A dark window held open over a pink room, with lit fireflies drifting inside it">
-      <span class="cap"><span class="name">Portal</span><span class="how">both hands</span></span>
+      <span class="cap">Portal</span>
     </a>
 
     <a class="piece" href="particles/">
-      <img src="thumbs/particles.jpg" width="900" height="600" alt="Thousands of cyan algae with a dark hand-shaped void swept through them">
-      <span class="cap"><span class="name">Bioluminescent Flow</span><span class="how">one hand</span></span>
+      <img src="thumbs/particles.jpg" width="900" height="600" alt="Two glowing blue hand silhouettes in a field of cyan algae, the algae swept into wakes around them">
+      <span class="cap">Bioluminescent Flow</span>
     </a>
 
     <a class="piece" href="webcam/">
       <img src="thumbs/webcam.jpg" width="900" height="600" loading="lazy" alt="Divya in the pixel mirror, her face and raised hand rebuilt in hot orange and deep blue">
-      <span class="cap"><span class="name">Webcam Magic</span><span class="how">one finger</span></span>
+      <span class="cap">Webcam Magic</span>
     </a>
 
     <a class="piece" href="emotion/">
       <img src="thumbs/emotion.jpg" width="900" height="600" loading="lazy" alt="A pink chrysanthemum in full bloom against near-black">
-      <span class="cap"><span class="name">(e)motion</span><span class="how">one hand</span></span>
+      <span class="cap">(e)motion</span>
     </a>
 
     <a class="piece" href="lenticular/">
       <img class="tall" src="thumbs/lenticular.jpg" width="414" height="638" loading="lazy" alt="A photograph of a Seoul rooftop with a drawn figure sitting on it, emerging in stripes">
-      <span class="cap"><span class="name">(un)seen Lenticular</span><span class="how">mouse</span></span>
+      <span class="cap">(un)seen Lenticular</span>
     </a>
 
   </div>
