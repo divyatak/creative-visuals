@@ -8,12 +8,6 @@
   html, body { width: 100%; height: 100%; overflow: hidden; background: #05060a; }
   canvas { display: block; width: 100vw; height: 100vh; }
   video { display: none; }
-  #hint {
-    position: fixed; left: 50%; bottom: 32px; transform: translateX(-50%);
-    font-family: monospace; font-size: 13px; letter-spacing: 2px;
-    color: rgba(255,255,255,0.4); pointer-events: none; text-align: center;
-    text-shadow: 0 1px 8px rgba(0,0,0,0.9); line-height: 1.8;
-  }
   /* tuning panels — only injected when the URL has ?tune, and only on localhost */
   #panels {
     position: fixed; top: 16px; right: 16px; z-index: 20;
@@ -53,7 +47,6 @@
 <body>
 <video id="cam" playsinline muted></video>
 <canvas id="stage"></canvas>
-<div id="hint">starting camera&hellip;</div>
 
 <script type="module">
 import { HandLandmarker, FilesetResolver } from
@@ -73,7 +66,6 @@ import { HandLandmarker, FilesetResolver } from
 const canvas = document.getElementById("stage");
 const ctx = canvas.getContext("2d", { alpha: false });
 const videoEl = document.getElementById("cam");
-const hintEl = document.getElementById("hint");
 
 let W = 0, H = 0, DPR = 1;
 function resize() {
@@ -113,11 +105,33 @@ const DEFAULTS = {
   bBank: 0.55, bRoll: 0.0,
   // firefly blink: charge -> fire -> decay, each flash nudging the others
   bBlink: 0.36,      // charge rate (flashes per second at spread 0)
-  bSpread: 0.17,     // how much individual rates differ, +/- fraction
-  bFlashDur: 0.06,   // seconds for a flash to fall to 2%
+  bSpread: 0.03,     // how much individual rates differ, +/- fraction (the fastest pacemaker leads)
+  // Who keeps the rhythm. A few bodies are pacemakers with a clock of their
+  // own; everyone else ANSWERS - flashes when a flash reaches them and they
+  // have recovered - and only flickers unprompted at the follower rate if no
+  // light finds them for a long while. Answering is what lets the wave ride a
+  // flock in full flight: a body carried somewhere new just replies when the
+  // front reaches it (or sits one out), instead of firing on a clock set for
+  // the place it used to be and seeding a stray front.
+  bLeaders: 0.02,    // fraction of the flock that are pacemakers (at least one)
+  bFollow: 0.35,     // a follower's own clock, relative to a pacemaker's
+  bFlashDur: 0.9,    // seconds a flash lasts, from first swell to gone
+  bAttack: 0.35,     // fraction of that spent swelling up to peak; the rest is the ease-out
   bBase: 0.08,       // resting glow between flashes
   bSwell: 0.22,      // how much the body grows at peak flash
-  bSync: 1.0, bGlow: 1.0
+  // how one firefly's flash moves the clocks of the ones that can see it
+  bSeeR: 0.08,       // how far a flash is visible, in field units (1 = the whole world) - near neighbours, not half the flock
+  bSync: 0.06,       // the nudge: how far forward (fraction of a cycle) a seen flash pushes a PACEMAKER's clock
+  // The spreading-vs-sync dial: how much of a cycle the front takes to cross
+  // the whole flock. Light does not get a speed of its own - it is DERIVED
+  // every frame from the flock's measured extent and the blink period so the
+  // sweep stays what you asked for however the flock is spread or squeezed.
+  // 0 = everyone together; ~0.45 = one front crossing per cycle; the longer
+  // the sweep the longer the flock takes to settle into it (0.6 needs most of
+  // a minute; past ~0.7 it never does, which is why the slider stops at 0.65).
+  bSweep: 0.45,
+  bGlint: 0.3,       // how visibly a body glints when a flash reaches it (0 = invisible)
+  bGlow: 1.0
 };
 
 const IS_LOCAL = ["localhost", "127.0.0.1", "::1", ""].includes(location.hostname);
@@ -175,9 +189,8 @@ async function start() {
     videoEl.srcObject = stream;
     await videoEl.play();
     videoReady = true;
-    hintEl.textContent = "loading hand tracking…";
   } catch (e) {
-    hintEl.textContent = "no camera — drag with the mouse to hold a portal open";
+    console.warn("portal: no camera — drag with the mouse to hold a portal open");
     return;
   }
   try {
@@ -192,9 +205,8 @@ async function start() {
       runningMode: "VIDEO", numHands: 2,
       minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
     });
-    hintEl.textContent = "pinch both hands, then open your fingers and pull apart";
   } catch (e) {
-    hintEl.textContent = "hand tracking failed to load";
+    console.warn("portal: hand tracking failed to load", e);
   }
 }
 start();
@@ -444,9 +456,18 @@ function blot(sprite, x, y, r, alpha) {
 // way anything with lift does. Nothing tumbles at random, so a body's attitude
 // always tells you where it is going.
 //
-// They also carry the fireflies' integrate-and-fire blink: each charges at its
-// own rate and flashes when it tops out, and every flash nudges the others
-// forward, so the flock drifts into synchrony and loosens again.
+// They also carry the fireflies' flash-and-answer. A few PACEMAKERS keep a
+// rhythm the Nicky Case way: a clock that tops out, flashes, resets, and is
+// nudged forward by any flash it sees, so several pacemakers fall into step.
+// Everyone else ANSWERS: when a flash reaches a body that has recovered from
+// its last one, it flashes back at once - which reaches its neighbours - so a
+// flash runs through the flock as a chain, each hop taking a moment to arrive
+// (how long is set by the sweep dial as a share of the cycle; light speed is
+// derived from the flock's measured width so that share holds). Nobody hears
+// the whole flock, only what is in reach. A body is deaf for a stretch after
+// its own flash (see deafSecs()) so the answers coming back cannot set it off
+// again, and a deaf body simply sits that wave out and catches the next -
+// which is why the wave survives a flock in full flight.
 // ---------------------------------------------------------------------------
 const FLOCK = (() => {
   let b = [];
@@ -463,10 +484,71 @@ const FLOCK = (() => {
         hue: (Math.random() * HUES) | 0,     // fixed for life; see buildPalette
         // rvar is this body's fixed deviation from the flock's blink rate; the
         // spread dial scales it, so widening the spread re-fans the same bodies
-        ph: Math.random(), rvar: rnd(-1, 1), flash: 0
+        ph: Math.random(), rvar: rnd(-1, 1), flash: 0,
+        nFires: 0,        // lifetime flash count (bench instrumentation)
+        fAge: Infinity,   // seconds since it last flashed
+        gAge: Infinity    // seconds since a neighbour's light last reached it
       });
     }
   }
+
+  // A flash in flight: the light leaving a body at (u,v), currently r out from
+  // it on its way to bSeeR. Invisible - the bodies it reaches are what you see.
+  const pulses = [];
+  // The flock's extent along its longer axis, smoothed, measured as it
+  // updates. This is what turns the sweep dial into a light speed: the wave
+  // starts from the body with the most neighbours - the middle - so a front
+  // has to cover HALF this distance in (bSweep x period) seconds. Smoothed so
+  // the speed does not twitch with every straggler.
+  let extent = 0.3;
+  function lightSpeed() {
+    const period = 1 / Math.max(0.01, params.bBlink);
+    const sweepSecs = Math.max(0.02, params.bSweep) * period;   // never quite zero, never instant
+    // Light must clearly outrun the planes. If it does not, a body that has
+    // just answered travels along with the front, recovers while still beside
+    // it, and answers again - the front never dies and the flock fires
+    // continuously (measured: fine at light = 2.2x flock speed, gone at
+    // 1.4x). So asking for a longer sweep than the flock's speed allows just
+    // stops slowing the light: the wave shortens rather than dissolving.
+    return Math.max((extent / 2) / sweepSecs, 2 * params.bSpeed);
+  }
+  // A flash is a soft hump, not a blink: it swells up over the first bAttack
+  // of its length and eases out over the rest, with no corner at the peak.
+  function envelope(age, dur, att) {
+    if (age >= dur) return 0;
+    const a = dur * att;
+    return age < a ? smoothstep(0, a, age) : 1 - smoothstep(a, dur, age);
+  }
+  function fire(p) {
+    p.ph = 0; p.fAge = 0; p.nFires++;
+    // a body cannot have more flashes in flight than fit in its own deaf
+    // window, so a few per body is already generous
+    if (pulses.length < b.length * 4) pulses.push({ u: p.u, v: p.v, r: 0, src: p });
+  }
+  // How long after its own flash a body stays deaf, as a fraction of the
+  // cycle. Not a number of its own: it is exactly as long as it has to be for
+  // the body's light to reach its farthest neighbour and that neighbour's
+  // answer to come back (out and back at reach speed) plus the time it is
+  // itself lit - so whatever you do to see radius, reach speed, flash length
+  // or blink rate, an answer can never bounce a body forward a second time.
+  function deafSecs() {
+    // Deaf while it is itself lit, and at least until the whole wave it is
+    // part of has gone by: the front takes the sweep to reach the edge, and
+    // the last answers out there need one more hop (see radius at light
+    // speed) to arrive. A body that woke sooner would hear those late answers
+    // and fire again - a second front, then continuous firing (measured).
+    // Whichever is longer, but always leaving a sliver of the cycle to listen
+    // in, so a body can always still be reached.
+    // The front may start anywhere - a pacemaker at the edge sweeps the whole
+    // extent, not half - so the worst case is the full extent at light speed.
+    const period = 1 / Math.max(0.01, params.bBlink);
+    const light = Math.max(1e-6, lightSpeed());
+    const secs = Math.max(params.bFlashDur, (extent + params.bSeeR) / light);
+    return Math.min(secs, 0.85 * period);
+  }
+  // pacemakers are simply the first few bodies, so the dial re-assigns
+  // without a rebuild and never reshuffles who leads
+  const nLeaders = () => Math.max(1, Math.round(b.length * params.bLeaders));
 
   // A directional tetrahedron: one vertex is the nose on the local +x axis, the
   // other three form the base ring behind it. Not the symmetric corner-of-a-cube
@@ -489,14 +571,44 @@ const FLOCK = (() => {
 
   return {
     rebuild,
+    bodies: () => b,   // read-only peek for the tuning bench
     update(dt) {
       const N = b.length;
       const PERC = params.bPerc, SEP = params.bSep;
       const marg = params.bMargin / WORLD;
       const MAXS = params.bSpeed, MINS = MAXS * 0.38;
       const smooth = Math.min(1, dt * 8);
-      let fired = 0;
 
+      // Flashes in flight reach the bodies in their path. The band a pulse
+      // sweeps this frame is (r0, r1]; every body in it that is not deaf gets
+      // the nudge, and one tipped over the top fires now - so its own light
+      // sets off from here, and the chain keeps going.
+      const SEE = params.bSeeR, NUDGE = params.bSync, DEAF = deafSecs();
+      const WAVE = lightSpeed(), NL = nLeaders();
+      for (let k = pulses.length - 1; k >= 0; k--) {
+        const q = pulses[k];
+        const r0 = q.r, r1 = Math.min(SEE, r0 + WAVE * dt);
+        q.r = r1;
+        const r02 = r0 * r0, r12 = r1 * r1;
+        for (let i = 0; i < N; i++) {
+          const p = b[i];
+          if (p === q.src || p.fAge < DEAF) continue;
+          const dx = p.u - q.u, dy = p.v - q.v;
+          const d2 = dx * dx + dy * dy;
+          if (d2 <= r02 || d2 > r12) continue;
+          if (i < NL) {
+            // a pacemaker is nudged, and fires at once if that tips it
+            p.ph += NUDGE;
+            if (p.ph >= 1) fire(p);
+            else p.gAge = 0;
+          } else {
+            fire(p);   // a follower answers
+          }
+        }
+        if (r1 >= SEE) pulses.splice(k, 1);
+      }
+
+      let minU = 1e9, maxU = -1e9, minV = 1e9, maxV = -1e9;
       for (let i = 0; i < N; i++) {
         const p = b[i];
         let cu = 0, cv = 0, au = 0, av = 0, su = 0, sv = 0, n = 0;
@@ -557,18 +669,22 @@ const FLOCK = (() => {
         p.spiral += params.bRoll * p.spin * dt;
         p.roll = clamp(-p.turnRate * params.bBank, -1.3, 1.3) + p.spiral;
 
-        // integrate-and-fire: charge climbs at this body's own rate, fires at
-        // the top, resets, and the flash decays over bFlashDur
-        p.ph += (1 + p.rvar * params.bSpread) * params.bBlink * dt;
-        if (p.ph >= 1) { p.ph = 0; p.flash = 1; fired++; }
-        p.flash *= Math.pow(0.02, dt / Math.max(0.008, params.bFlashDur));
-      }
+        // the clock: a pacemaker's ticks at the shared rate; a follower's much
+        // slower, so it only flashes unprompted when no light has found it
+        // for a long while. Either flashes at the top and resets.
+        p.ph += (i < NL ? 1 : params.bFollow) * (1 + p.rvar * params.bSpread) * params.bBlink * dt;
+        if (p.ph >= 1) fire(p);
+        // what you see: its own flash, or the glint of a neighbour's light
+        // landing on it - the same soft shape at a fraction of the length
+        p.fAge += dt; p.gAge += dt;
+        const D = Math.max(0.02, params.bFlashDur), A = params.bAttack;
+        p.flash = Math.max(envelope(p.fAge, D, A), params.bGlint * envelope(p.gAge, D * 0.5, A));
 
-      // every flash nudges the rest forward, so the flock falls into sync
-      if (fired && params.bSync > 0) {
-        const kick = Math.min(0.05, fired * 0.0016) * params.bSync;
-        for (const p of b) if (p.flash < 0.5) p.ph = Math.min(0.999, p.ph + kick);
+        if (p.u < minU) minU = p.u; if (p.u > maxU) maxU = p.u;
+        if (p.v < minV) minV = p.v; if (p.v > maxV) maxV = p.v;
       }
+      // the flock's longer side, eased over about a second
+      if (N) extent += (Math.max(maxU - minU, maxV - minV, 0.02) - extent) * Math.min(1, dt * 1.0);
     },
 
     // `alpha` is the deliberate opacity dial only. It is NOT scaled by how far
@@ -643,6 +759,7 @@ const FLOCK = (() => {
 })();
 buildPalette();
 FLOCK.rebuild();
+if (TUNING) window.__portal = { params, FLOCK };   // bench-only hook for instrumenting the piece
 
 // ---------------------------------------------------------------------------
 // Tuning panels
@@ -729,7 +846,7 @@ if (TUNING) {
       { key: "bSize", label: "size", min: 3, max: 40, step: 0.5 },
       { key: "bStretch", label: "nose length", min: 0.4, max: 4, step: 0.05 },
       { key: "bFill", label: "solidity", min: 0, max: 1, step: 0.01 },
-      { key: "bSpeed", label: "speed", min: 0.02, max: 0.5, step: 0.005 },
+      { key: "bSpeed", label: "speed", min: 0.005, max: 0.5, step: 0.005 },
       { key: "bBank", label: "bank into turns", min: 0, max: 3, step: 0.05 },
       { key: "bRoll", label: "barrel roll", min: 0, max: 4, step: 0.05 },
       { key: "bPerc", label: "perception", min: 0.02, max: 0.35, step: 0.005 },
@@ -741,8 +858,14 @@ if (TUNING) {
       { key: "bMargin", label: "wall margin px", min: 5, max: 250, step: 5 },
       { key: "bBlink", label: "blink rate", min: 0, max: 2, step: 0.01 },
       { key: "bSpread", label: "blink spread", min: 0, max: 1, step: 0.01 },
-      { key: "bFlashDur", label: "flash length", min: 0.01, max: 1.2, step: 0.01 },
-      { key: "bSync", label: "blink sync", min: 0, max: 3, step: 0.05 },
+      { key: "bFlashDur", label: "flash length", min: 0.05, max: 3, step: 0.01 },
+      { key: "bAttack", label: "flash rise", min: 0.05, max: 0.8, step: 0.01 },
+      { key: "bSeeR", label: "see radius", min: 0.03, max: 0.6, step: 0.01 },
+      { key: "bLeaders", label: "pacemakers (share)", min: 0.005, max: 0.3, step: 0.005 },
+      { key: "bFollow", label: "follower own clock", min: 0, max: 1, step: 0.01 },
+      { key: "bSync", label: "pacemaker nudge", min: 0, max: 0.4, step: 0.005 },
+      { key: "bSweep", label: "sweep (0 together -> 0.65 long waves)", min: 0, max: 0.65, step: 0.01 },
+      { key: "bGlint", label: "glint on receipt", min: 0, max: 0.8, step: 0.01 },
       { key: "bBase", label: "resting glow", min: 0, max: 1, step: 0.01 },
       { key: "bSwell", label: "flash swell", min: 0, max: 2, step: 0.02 },
       { key: "bGlow", label: "glow", min: 0.1, max: 3, step: 0.05 }
@@ -803,9 +926,11 @@ function quadPath(c) {
 
 function frame() {
   requestAnimationFrame(frame);
+  if (window.__portal) window.__portal.frames = (window.__portal.frames | 0) + 1;
   const now = performance.now();
   let dt = (now - last) / 1000; if (dt > 0.05) dt = 0.05;
   last = now;
+  if (window.__portal) window.__portal.simT = (window.__portal.simT || 0) + dt;
 
   sizeWorld();
   detectHands();
