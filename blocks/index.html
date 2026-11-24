@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Blocks</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #05060a; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  video { display: none; }
+  #hint {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    font: 11px monospace; letter-spacing: 1px; color: rgba(200,215,235,0.45);
+    pointer-events: none; text-align: center; white-space: nowrap;
+    transition: opacity 1.2s;
+  }
+  #hint.off { opacity: 0; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="stage"></canvas>
+<div id="hint">HOLD THE BOX BETWEEN YOUR HANDS &middot; SLIDE IT UNDER A PIECE &middot; TILT IT TO TURN THE PIECE<br><span style="opacity:.6">no camera: mouse moves the box, wheel or Q / E tilts it</span></div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18";
+
+// ---------------------------------------------------------------------------
+// BLOCKS — a rigid box held between your two hands, and tetrominoes drifting
+// down from the top of the room. The box does not change shape; you carry it.
+// Slide it under a piece to choose the column it lands in. Tilt it and the
+// piece — which keeps falling straight down through the room — enters the box
+// turned, so the box's tilt IS the piece's rotation. Fill a row and it clears.
+// Overfill the box and it tips out. The pieces live in the room, not in the
+// box: the box is a thing that moves through them, and its walls shove them.
+// ---------------------------------------------------------------------------
+
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+const videoEl = document.getElementById("cam");
+const hintEl = document.getElementById("hint");
+
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+resize();
+window.addEventListener("resize", resize);
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rnd = (a, b) => a + Math.random() * (b - a);
+const lerp = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+// shortest signed angular distance
+const angDiff = (a, b) => { let d = (b - a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+
+// ---------------------------------------------------------------------------
+// Tunables. defaults.json overrides these; everything is relative to the box's
+// cell size (itself derived from the viewport) so nothing is in raw pixels.
+// ---------------------------------------------------------------------------
+const DEFAULTS = {
+  minCutoff: 1.4, beta: 0.010,  // One Euro smoothing on the pinch points
+  cols: 7, rows: 9,             // the box's grid
+  cellFrac: 0.038,              // cell size as a fraction of the shorter screen edge
+  fall: 1.6,                    // piece fall speed, cells per second
+  spawnEvery: 3.2,              // seconds between pieces
+  maxPieces: 4,                 // in the air at once
+  sway: 0.35,                   // sideways drift amplitude, cells
+  spin: 0.0,                    // free pieces turn this much, turns per second (0 = only the box turns them)
+  snapIn: 2.0,                  // how far above the mouth (cells) a piece starts settling onto the grid
+  clearFlash: 0.45,             // seconds a full row glows before it goes
+  spillG: 9,                    // gravity for spilled cells, cells per second^2
+  color: "#f2c86b",             // the box
+  hue0: 30, hueSpan: 300        // piece hues: each of the seven pieces gets its own slice of this range
+};
+const params = Object.assign({}, DEFAULTS);
+try { Object.assign(params, await (await fetch("./defaults.json", { cache: "no-store" })).json()); } catch (e) {}
+
+// ---- One Euro filter ------------------------------------------------------
+const DCUTOFF = 1.0;
+function makeEuro() {
+  let x = null, dx = 0, t = 0;
+  const alpha = (cut, dt) => { const tau = 1 / (2 * Math.PI * cut); return 1 / (1 + tau / dt); };
+  return {
+    reset() { x = null; dx = 0; },
+    filter(v, tMs) {
+      if (x === null) { x = v; t = tMs; return v; }
+      let dt = (tMs - t) / 1000; if (dt <= 0) dt = 1 / 60;
+      t = tMs;
+      const d = (v - x) / dt;
+      dx += alpha(DCUTOFF, dt) * (d - dx);
+      const cut = params.minCutoff + params.beta * Math.abs(dx);
+      x += alpha(cut, dt) * (v - x);
+      return x;
+    }
+  };
+}
+const euro = [0, 1].map(() => ({ x: makeEuro(), y: makeEuro() }));
+function euroResetAll() { for (const e of euro) { e.x.reset(); e.y.reset(); } }
+
+// ---------------------------------------------------------------------------
+// Hand tracking — the box's two handles are the pinch points (thumb tip +
+// index tip midpoint) of each hand. Two hands: handles at both. One hand: that
+// hand carries the box level. Mouse when there is no camera.
+// ---------------------------------------------------------------------------
+const THUMB_TIP = 4, INDEX_TIP = 8;
+let handLandmarker = null, videoReady = false, lastDetect = 0;
+let rawHandles = null;   // [{x,y}, {x,y}] or [{x,y}] or null
+
+async function start() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: "user" }
+    });
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    videoReady = true;
+  } catch (e) {
+    console.warn("blocks: no camera — the mouse carries the box");
+    return;
+  }
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO", numHands: 2,
+      minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
+    });
+  } catch (e) {
+    console.warn("blocks: hand tracking failed to load", e);
+  }
+}
+start();
+
+function videoFit() {
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  if (!vw) return null;
+  const s = Math.min(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s;
+  return { dw, dh, dx: (W - dw) / 2, dy: (H - dh) / 2 };
+}
+function lmToScreen(lm, fit) {
+  return { x: W - (fit.dx + lm.x * fit.dw), y: fit.dy + lm.y * fit.dh };
+}
+function readHandles(hands, fit) {
+  if (!hands.length) return null;
+  const pts = hands.slice(0, 2).map(lm => {
+    const t = lmToScreen(lm[THUMB_TIP], fit), i = lmToScreen(lm[INDEX_TIP], fit);
+    return { x: (t.x + i.x) / 2, y: (t.y + i.y) / 2 };
+  });
+  pts.sort((p, q) => p.x - q.x);
+  return pts;
+}
+function detectHands() {
+  if (!handLandmarker || !videoReady) return;
+  const now = performance.now();
+  if (now - lastDetect < 33) return;
+  lastDetect = now;
+  const fit = videoFit();
+  if (!fit) return;
+  let res;
+  try { res = handLandmarker.detectForVideo(videoEl, now); } catch (e) { return; }
+  rawHandles = readHandles((res && res.landmarks) || [], fit);
+}
+
+// ---- mouse fallback ------------------------------------------------------
+let mouse = null, mouseAngle = 0, mouseSeen = false;
+window.addEventListener("mousemove", e => { mouse = { x: e.clientX, y: e.clientY }; mouseSeen = true; });
+window.addEventListener("wheel", e => { mouseAngle += e.deltaY * 0.0025; }, { passive: true });
+window.addEventListener("keydown", e => {
+  if (e.key === "q" || e.key === "Q" || e.key === "ArrowLeft") mouseAngle -= Math.PI / 12;
+  if (e.key === "e" || e.key === "E" || e.key === "ArrowRight") mouseAngle += Math.PI / 12;
+  if (e.key === "r" || e.key === "R") resetGame();
+});
+
+// ---------------------------------------------------------------------------
+// The box. A rigid grid of cols x rows cells, centre (cx, cy), angle a. Its
+// local frame: x across, y DOWN the box, origin at the middle of the mouth.
+// ---------------------------------------------------------------------------
+let CELL = 30;
+function sizeCell() { CELL = Math.min(W, H) * params.cellFrac; }
+
+const box = { cx: 0, cy: 0, a: 0, held: 0, vx: 0, vy: 0, va: 0, px: 0, py: 0, pa: 0, shake: 0 };
+let boxInit = false;
+
+function toLocal(x, y, out) {
+  const dx = x - box.cx, dy = y - box.cy;
+  const c = Math.cos(-box.a), s = Math.sin(-box.a);
+  out.x = dx * c - dy * s;
+  out.y = dx * s + dy * c;
+  return out;
+}
+function toWorld(lx, ly, out) {
+  const c = Math.cos(box.a), s = Math.sin(box.a);
+  out.x = box.cx + lx * c - ly * s;
+  out.y = box.cy + lx * s + ly * c;
+  return out;
+}
+const _l = { x: 0, y: 0 }, _w = { x: 0, y: 0 };
+
+// ---------------------------------------------------------------------------
+// Tetrominoes. Cells are listed relative to a rotation centre so that turning
+// by 90 degrees is a coordinate swap, and shapes with an even footprint get a
+// half-cell centre so they still land on the grid after a turn.
+// ---------------------------------------------------------------------------
+const SHAPES = [
+  { n: "I", c: [[-1.5, -0.5], [-0.5, -0.5], [0.5, -0.5], [1.5, -0.5]] },
+  { n: "O", c: [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]] },
+  { n: "T", c: [[-1, 0], [0, 0], [1, 0], [0, -1]] },
+  { n: "S", c: [[-1, 0], [0, 0], [0, -1], [1, -1]] },
+  { n: "Z", c: [[-1, -1], [0, -1], [0, 0], [1, 0]] },
+  { n: "J", c: [[-1, -1], [-1, 0], [0, 0], [1, 0]] },
+  { n: "L", c: [[1, -1], [-1, 0], [0, 0], [1, 0]] }
+];
+// rotate a cell offset by r quarter turns (clockwise in screen space, y down)
+function rotCell(cx, cy, r) {
+  r = ((r % 4) + 4) % 4;
+  for (let i = 0; i < r; i++) { const t = cx; cx = -cy; cy = t; }
+  return [cx, cy];
+}
+function shapeHue(i) { return (params.hue0 + params.hueSpan * i / SHAPES.length) % 360; }
+
+// ---------------------------------------------------------------------------
+// Game state
+// ---------------------------------------------------------------------------
+let grid = [];            // rows x cols of null | { hue }
+let pieces = [];          // free pieces in the room
+let spill = [];           // loose cells tumbling out of a tipped box
+let clearing = [];        // { row, t }
+let flashes = [];         // { x, y, hue, t } world-space bursts
+let score = 0, missed = 0, spawnT = 0, gameT = 0, bag = [];
+let tipT = 0;             // > 0 while the box is tipping out
+
+function resetGame() {
+  grid = Array.from({ length: params.rows }, () => new Array(params.cols).fill(null));
+  pieces = []; spill = []; clearing = []; flashes = [];
+  score = 0; missed = 0; spawnT = 0; gameT = 0; bag = [];
+}
+resetGame();
+
+function nextShape() {
+  if (!bag.length) bag = SHAPES.map((_, i) => i).sort(() => Math.random() - 0.5);
+  return bag.pop();
+}
+function spawnPiece() {
+  const s = nextShape();
+  pieces.push({
+    s, r: Math.floor(Math.random() * 4), hue: shapeHue(s),
+    x: rnd(W * 0.18, W * 0.82), y: -CELL * 2.5,
+    phase: rnd(0, TAU), swayF: rnd(0.25, 0.45),
+    va: 0, a: 0,          // visual angle in the room, eased toward the box when near it
+    ease: 0,              // 0 = free, 1 = fully on the grid
+    dx: 0, dy: 0          // eased visual offset onto the grid
+  });
+}
+
+// The piece's pose on the box's grid, from its world position. Column and
+// rotation are snapped; the row is continuous (it is still falling).
+function gridPose(p, out) {
+  toLocal(p.x, p.y, _l);
+  const rel = Math.round(angDiff(box.a, p.a) / (Math.PI / 2));
+  const r = p.r + rel;
+  const sh = SHAPES[p.s];
+  // parity: shapes with a half-cell centre snap to half positions
+  const half = Math.abs(sh.c[0][0] % 1) > 0.01 ? 0.5 : 0;
+  const gx = Math.round(_l.x / CELL - half) + half;    // centre in cell units, x across from the box middle
+  const gy = _l.y / CELL;                              // continuous, down from the mouth
+  out.gx = gx; out.gy = gy; out.r = r; out.rel = rel; out.lx = _l.x; out.ly = _l.y;
+  return out;
+}
+const _pose = {};
+
+// cells of a piece at pose (gx, gy, r): column index and continuous row
+function pieceCells(p, gx, gy, r) {
+  const sh = SHAPES[p.s];
+  const out = [];
+  for (const [ox, oy] of sh.c) {
+    const [rx, ry] = rotCell(ox, oy, r);
+    out.push([gx + rx + params.cols / 2 - 0.5, gy + ry]);
+  }
+  return out;
+}
+
+function tipBox() {
+  // everything in the box becomes loose and falls out of the mouth
+  for (let r = 0; r < params.rows; r++) for (let c = 0; c < params.cols; c++) {
+    const g = grid[r][c]; if (!g) continue;
+    toWorld((c - params.cols / 2 + 0.5) * CELL, (r + 0.5) * CELL, _w);
+    spill.push({ x: _w.x, y: _w.y, vx: rnd(-1, 1) * CELL * 3, vy: rnd(-4, -1) * CELL, a: box.a, va: rnd(-4, 4), hue: g.hue, t: 0 });
+  }
+  for (const p of pieces) if (p.ease > 0.5) {
+    spill.push({ x: p.x, y: p.y, vx: rnd(-1, 1) * CELL * 3, vy: rnd(-4, -1) * CELL, a: p.a, va: rnd(-4, 4), hue: p.hue, t: 0, piece: p });
+  }
+  pieces = pieces.filter(p => p.ease <= 0.5);
+  grid = Array.from({ length: params.rows }, () => new Array(params.cols).fill(null));
+  clearing = [];
+  box.shake = 1;
+  tipT = 1;
+}
+
+function step(dt) {
+  gameT += dt;
+  spawnT -= dt;
+  if (spawnT <= 0 && pieces.length < params.maxPieces && box.held > 0.01) {
+    spawnPiece();
+    spawnT = params.spawnEvery * rnd(0.8, 1.2);
+  }
+
+  // row clears
+  for (const cl of clearing) cl.t -= dt;
+  const done = clearing.filter(cl => cl.t <= 0).map(cl => cl.row).sort((a, b) => a - b);
+  if (done.length) {
+    for (const row of done) {
+      grid.splice(row, 1);
+      grid.unshift(new Array(params.cols).fill(null));
+    }
+    clearing = clearing.filter(cl => cl.t > 0);
+  }
+
+  // free pieces
+  const fallPx = params.fall * CELL * dt;
+  for (let i = pieces.length - 1; i >= 0; i--) {
+    const p = pieces[i];
+    p.y += fallPx;
+    p.x += Math.sin(gameT * p.swayF * TAU + p.phase) * params.sway * CELL * dt * 1.5;
+    p.a += params.spin * TAU * dt;
+
+    gridPose(p, _pose);
+    const cells = pieceCells(p, _pose.gx, _pose.gy, _pose.r);
+    let minCol = Infinity, maxCol = -Infinity, maxRow = -Infinity, minRow = Infinity;
+    for (const [c, r] of cells) { minCol = Math.min(minCol, c); maxCol = Math.max(maxCol, c); maxRow = Math.max(maxRow, r); minRow = Math.min(minRow, r); }
+
+    // is it over the box at all? within (or near) the mouth's span, and above the floor
+    const overX = maxCol >= -1 && minCol <= params.cols && Math.abs(_pose.lx) < (params.cols / 2 + 2.5) * CELL;
+    const nearMouth = _pose.ly > -params.snapIn * CELL && _pose.ly < (params.rows + 1) * CELL;
+    const engaged = box.held > 0.5 && overX && nearMouth && maxRow > -params.snapIn;
+
+    if (engaged) {
+      // the walls shove the piece so its cells fit between them
+      let push = 0;
+      if (minCol < 0) push = -minCol;
+      else if (maxCol > params.cols - 1) push = params.cols - 1 - maxCol;
+      if (push !== 0 && maxRow > -0.5) {
+        // move the piece in world space by push cells along the box's x axis
+        p.x += push * CELL * Math.cos(box.a);
+        p.y += push * CELL * Math.sin(box.a);
+        gridPose(p, _pose);
+        for (const cell of cells) cell[0] += push;
+        minCol += push; maxCol += push;
+      }
+      // landing: any cell whose next row is the floor or a filled cell
+      let land = false, landRow = 0;
+      for (const [c, r] of cells) {
+        const ci = Math.round(c);
+        if (ci < 0 || ci >= params.cols) continue;
+        const below = Math.floor(r + 0.5);      // the row this cell would occupy
+        if (below >= params.rows) { land = true; break; }
+        if (below >= 0 && grid[below][ci]) { land = true; break; }
+      }
+      if (land) {
+        // each cell's row is the one its centre is in; then lift the whole
+        // piece by whole rows until nothing overlaps
+        let shift = 0;
+        const fits = (sh) => cells.every(([c, r]) => {
+          const ci = Math.round(c), ri = Math.floor(r) + sh;
+          if (ci < 0 || ci >= params.cols) return false;
+          if (ri >= params.rows) return false;
+          if (ri < 0) return true;
+          return !grid[ri][ci];
+        });
+        let guard = 0;
+        while (!fits(shift) && guard++ < params.rows + 6) shift--;
+        let overflow = false, sumRow = 0;
+        for (const [c, r] of cells) {
+          const ci = Math.round(c), ri = Math.floor(r) + shift;
+          sumRow += ri;
+          if (ri < 0) { overflow = true; continue; }
+          if (ri < params.rows && ci >= 0 && ci < params.cols) grid[ri][ci] = { hue: p.hue, t: 0 };
+        }
+        pieces.splice(i, 1);
+        toWorld(_pose.gx * CELL, (sumRow / cells.length + 0.5) * CELL, _w);
+        flashes.push({ x: _w.x, y: _w.y, hue: p.hue, t: 0, r: CELL * 1.5 });
+        if (overflow) { tipBox(); continue; }
+        // full rows
+        for (let r = 0; r < params.rows; r++) {
+          if (grid[r].every(Boolean) && !clearing.some(cl => cl.row === r)) {
+            clearing.push({ row: r, t: params.clearFlash });
+            score++;
+          }
+        }
+        continue;
+      }
+      // still falling inside: ease the drawn pose onto the grid
+      p.ease = lerp(p.ease, 1, 1 - Math.pow(0.002, dt));
+      // the world angle at which the piece's cells line up with the grid at
+      // its snapped rotation — kept as a drawn offset so the logical p.a is untouched
+      p.va = angDiff(p.a, box.a + _pose.rel * Math.PI / 2);
+      toWorld(_pose.gx * CELL, _pose.ly, _w);
+      p.dx = _w.x - p.x; p.dy = _w.y - p.y;
+    } else {
+      p.ease = lerp(p.ease, 0, 1 - Math.pow(0.02, dt));
+      p.va = 0; p.dx = 0; p.dy = 0;
+    }
+
+    if (p.y > H + CELL * 3) { pieces.splice(i, 1); missed++; }
+  }
+
+  // spilled cells
+  for (let i = spill.length - 1; i >= 0; i--) {
+    const s = spill[i];
+    s.vy += params.spillG * CELL * dt;
+    s.x += s.vx * dt; s.y += s.vy * dt; s.a += s.va * dt; s.t += dt;
+    if (s.y > H + CELL * 4) spill.splice(i, 1);
+  }
+  for (let i = flashes.length - 1; i >= 0; i--) { flashes[i].t += dt; if (flashes[i].t > 0.6) flashes.splice(i, 1); }
+  tipT = Math.max(0, tipT - dt);
+  box.shake = Math.max(0, box.shake - dt * 1.6);
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
+function drawVideo() {
+  ctx.fillStyle = "#05060a";
+  ctx.fillRect(0, 0, W, H);
+  const fit = videoFit();
+  if (!fit) return;
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  ctx.translate(W, 0); ctx.scale(-1, 1);
+  ctx.drawImage(videoEl, fit.dx, fit.dy, fit.dw, fit.dh);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function cellRect(x, y, size, hue, alpha, glow) {
+  const s = size * 0.9, o = -s / 2;
+  ctx.globalAlpha = alpha;
+  if (glow > 0) {
+    ctx.shadowColor = `hsla(${hue}, 90%, 65%, ${0.9 * glow})`;
+    ctx.shadowBlur = size * 0.9 * glow;
+  }
+  ctx.fillStyle = `hsl(${hue}, 78%, ${52 + glow * 25}%)`;
+  ctx.fillRect(x + o, y + o, s, s);
+  ctx.shadowBlur = 0;
+  // an inner bevel: a lighter top-left edge and a darker bottom-right
+  ctx.fillStyle = `hsla(${hue}, 90%, 85%, 0.45)`;
+  ctx.fillRect(x + o, y + o, s, s * 0.16);
+  ctx.fillRect(x + o, y + o, s * 0.16, s);
+  ctx.fillStyle = "rgba(0,0,0,0.28)";
+  ctx.fillRect(x + o, y + o + s * 0.84, s, s * 0.16);
+  ctx.fillRect(x + o + s * 0.84, y + o, s * 0.16, s);
+  ctx.globalAlpha = 1;
+}
+
+function drawPiece(p) {
+  const sh = SHAPES[p.s];
+  const near = p.ease;
+  ctx.save();
+  ctx.translate(p.x + p.dx * near, p.y + p.dy * near);
+  ctx.rotate(p.a + p.va * near);
+  for (const [ox, oy] of sh.c) {
+    const [rx, ry] = rotCell(ox, oy, p.r);
+    cellRect(rx * CELL, ry * CELL, CELL, p.hue, 0.92, 0.35 + near * 0.35);
+  }
+  ctx.restore();
+}
+
+function drawBox(alpha) {
+  const w = params.cols * CELL, h = params.rows * CELL;
+  const sh = box.shake * box.shake;
+  ctx.save();
+  ctx.translate(box.cx + Math.sin(gameT * 71) * sh * CELL * 0.35, box.cy + Math.cos(gameT * 53) * sh * CELL * 0.25);
+  ctx.rotate(box.a + Math.sin(gameT * 47) * sh * 0.08);
+  ctx.globalAlpha = alpha;
+
+  // the box's inside: a dim well, deeper toward the floor
+  const g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, "rgba(10,12,22,0.55)");
+  g.addColorStop(1, "rgba(4,5,10,0.92)");
+  ctx.fillStyle = g;
+  ctx.fillRect(-w / 2, 0, w, h);
+
+  // faint grid
+  ctx.strokeStyle = "rgba(255,255,255,0.05)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let c = 1; c < params.cols; c++) { ctx.moveTo(-w / 2 + c * CELL, 0); ctx.lineTo(-w / 2 + c * CELL, h); }
+  for (let r = 1; r < params.rows; r++) { ctx.moveTo(-w / 2, r * CELL); ctx.lineTo(w / 2, r * CELL); }
+  ctx.stroke();
+
+  // settled cells
+  for (let r = 0; r < params.rows; r++) {
+    const cl = clearing.find(c => c.row === r);
+    const flash = cl ? 1 - cl.t / params.clearFlash : 0;
+    for (let c = 0; c < params.cols; c++) {
+      const cell = grid[r][c]; if (!cell) continue;
+      const x = -w / 2 + (c + 0.5) * CELL, y = (r + 0.5) * CELL;
+      if (cl) {
+        const pulse = 0.5 + 0.5 * Math.sin(flash * Math.PI * 6);
+        cellRect(x, y, CELL * (1 + flash * 0.2), cell.hue, alpha * (1 - flash * 0.7), 0.6 + pulse * 0.6);
+      } else {
+        cellRect(x, y, CELL, cell.hue, alpha, 0.12);
+      }
+    }
+  }
+
+  // the walls: an open-topped U, drawn with the box's colour, brightened by a tip
+  ctx.strokeStyle = params.color;
+  ctx.lineWidth = Math.max(2, CELL * 0.16);
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.shadowColor = params.color; ctx.shadowBlur = CELL * (0.5 + tipT * 1.5);
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, 0); ctx.lineTo(-w / 2, h); ctx.lineTo(w / 2, h); ctx.lineTo(w / 2, 0);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  // the handles, where the hands hold it
+  ctx.fillStyle = params.color;
+  ctx.beginPath();
+  ctx.arc(-w / 2, h * 0.5, CELL * 0.22, 0, TAU);
+  ctx.arc(w / 2, h * 0.5, CELL * 0.22, 0, TAU);
+  ctx.fill();
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD(alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.font = `${Math.round(Math.max(12, CELL * 0.5))}px monospace`;
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "rgba(220,230,245,0.75)";
+  ctx.fillText(`ROWS ${score}`, 24, 22);
+  ctx.fillStyle = "rgba(220,230,245,0.35)";
+  ctx.fillText(`MISSED ${missed}`, 24, 22 + CELL * 0.75);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// Frame
+// ---------------------------------------------------------------------------
+let last = performance.now();
+let hadHands = false, lastSource = "";
+
+function frame() {
+  requestAnimationFrame(frame);
+  if (window.__blocks) window.__blocks.frames++;
+  const now = performance.now();
+  let dt = (now - last) / 1000; if (dt > 0.05) dt = 0.05;
+  last = now;
+
+  sizeCell();
+  detectHands();
+  drawVideo();
+
+  // where the box wants to be
+  let target = null, source = "";
+  if (rawHandles && rawHandles.length) { target = rawHandles; source = "hand"; }
+  else if (mouseSeen && mouse) { target = [mouse]; source = "mouse"; }
+
+  if (target) {
+    if (!hadHands || source !== lastSource) euroResetAll();
+    hadHands = true;
+    const pts = target.map((p, i) => ({ x: euro[i].x.filter(p.x, now), y: euro[i].y.filter(p.y, now) }));
+    // The handles sit half-way down each wall, so the mouth's middle (the box
+    // origin) is half a box height up the box's own axis from the pinch line.
+    const h = params.rows * CELL;
+    let wantA, gripX, gripY;
+    if (pts.length >= 2) {
+      const [L, R] = pts;
+      wantA = Math.atan2(R.y - L.y, R.x - L.x);
+      gripX = (L.x + R.x) / 2; gripY = (L.y + R.y) / 2;
+    } else {
+      // one hand (or the mouse) carries the box by its middle, level
+      wantA = source === "mouse" ? mouseAngle : 0;
+      gripX = pts[0].x; gripY = pts[0].y;
+    }
+    const wantX = gripX + Math.sin(wantA) * h * 0.5;
+    const wantY = gripY - Math.cos(wantA) * h * 0.5;
+    if (!boxInit) { box.cx = wantX; box.cy = wantY; box.a = wantA; boxInit = true; }
+    const k = 1 - Math.pow(0.0005, dt);
+    box.cx += (wantX - box.cx) * k;
+    box.cy += (wantY - box.cy) * k;
+    box.a += angDiff(box.a, wantA) * k;
+  } else {
+    hadHands = false;
+  }
+  lastSource = source;
+  box.held += ((target ? 1 : 0) - box.held) * (1 - Math.pow(0.01, dt));
+  hintEl.classList.toggle("off", box.held > 0.5 && gameT > 4);
+
+  if (boxInit) step(dt);
+
+  // room-space things behind the box
+  for (const f of flashes) {
+    const t = f.t / 0.6;
+    ctx.globalAlpha = (1 - t) * 0.5;
+    ctx.strokeStyle = `hsl(${f.hue}, 90%, 70%)`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(f.x, f.y, f.r * (0.4 + t * 1.6), 0, TAU); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  if (boxInit) drawBox(0.35 + box.held * 0.65);
+  for (const p of pieces) drawPiece(p);
+  for (const s of spill) {
+    ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(s.a);
+    if (s.piece) {
+      const sh = SHAPES[s.piece.s];
+      for (const [ox, oy] of sh.c) { const [rx, ry] = rotCell(ox, oy, s.piece.r); cellRect(rx * CELL, ry * CELL, CELL, s.hue, 0.9, 0.2); }
+    } else cellRect(0, 0, CELL, s.hue, 0.9, 0.2);
+    ctx.restore();
+  }
+  drawHUD(0.35 + box.held * 0.65);
+}
+requestAnimationFrame(frame);
+
+// bench hook for headless probes — localhost only
+if (["localhost", "127.0.0.1", "::1", ""].includes(location.hostname)) {
+  window.__blocks = {
+    get pieces() { return pieces; }, get grid() { return grid; }, get box() { return box; },
+    get score() { return score; }, get missed() { return missed; }, get spill() { return spill; },
+    get CELL() { return CELL; }, params, frames: 0,
+    spawnAt(x, s, r) { spawnPiece(); const p = pieces[pieces.length - 1]; p.x = x; if (s != null) p.s = s; if (r != null) p.r = r; p.hue = shapeHue(p.s); return p; }
+  };
+}
+</script>
+</body>
+</html>

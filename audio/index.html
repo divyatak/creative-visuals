@@ -2,21 +2,28 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Audio Reactive</title>
+  <title>Soundscape</title>
   <style>
     * { margin: 0; padding: 0; }
     body { background: #050508; overflow: hidden; }
     canvas { display: block; }
-    #ui { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    #back { position: fixed; top: 20px; left: 20px; color: rgba(255,255,255,0.35);
+      font: 14px monospace; text-decoration: none; z-index: 40; cursor: pointer; }
+    #back:hover { color: rgba(255,255,255,0.8); }
+    #ui { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; }
     #ui.hidden { opacity: 0; pointer-events: none; transition: opacity 1s; }
     #drop-text { font: 22px monospace; color: rgba(255,255,255,0.3); letter-spacing: 3px; cursor: pointer; }
     #drop-sub { margin-top: 8px; font: 12px monospace; color: rgba(255,255,255,0.15); }
     #file-input { display: none; }
-    #back { position: fixed; top: 20px; left: 20px; color: rgba(255,255,255,0.35); font: 14px monospace; text-decoration: none; z-index: 40; }
-    #controls { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 20; opacity: 0; }
+    #controls { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      z-index: 20; opacity: 0; transition: opacity 0.5s; }
     #controls.visible { opacity: 1; }
-    #controls button { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: rgba(255,255,255,0.4); font: 13px monospace; padding: 6px 16px; border-radius: 4px; cursor: pointer; }
-    #mode-label { position: fixed; top: 20px; right: 20px; font: 12px monospace; color: rgba(255,255,255,0.2); z-index: 20; }
+    #controls button { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+      color: rgba(255,255,255,0.4); font: 13px monospace; padding: 6px 16px; border-radius: 4px; cursor: pointer; }
+    #controls button:hover { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.7); }
+    #loading { position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%);
+      font: 11px monospace; color: rgba(255,255,255,0.15); z-index: 20; }
   </style>
 </head>
 <body>
@@ -27,109 +34,45 @@
   </div>
   <input type="file" id="file-input" accept="audio/*">
   <div id="controls"><button id="pause-btn">pause</button></div>
-  <div id="mode-label">wireframe</div>
+  <div id="loading"></div>
 
   <script type="importmap">
-  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
   </script>
   <script type="module">
     import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    /* ── renderer (identical to working test.html) ── */
-    const renderer = new THREE.WebGLRenderer();
+    // ══════════════════════════════════════════════
+    // RENDERER
+    // ══════════════════════════════════════════════
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setClearColor(0x050508);
     document.body.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1000);
-    camera.position.set(0, 60, 250);
-    camera.lookAt(0, 0, 0);
+    // no fog — was causing dark overlay artifacts
 
-    /* ── MODE 0: SHATTERING WIREFRAME ── */
-    const mode0 = new THREE.Group();
-    const faces = [];
-    const srcGeo = new THREE.IcosahedronGeometry(60, 3);
-    // convert to non-indexed so we can just read position triples as faces
-    const nonIndexed = srcGeo.toNonIndexed();
-    const srcArr = nonIndexed.attributes.position.array;
-    for (let f = 0; f < srcArr.length; f += 9) {
-      const v = srcArr.slice(f, f + 9);
-      const cx = (v[0]+v[3]+v[6])/3, cy = (v[1]+v[4]+v[7])/3, cz = (v[2]+v[5]+v[8])/3;
-      const d = Math.sqrt(cx*cx+cy*cy+cz*cz) || 1;
-      // local space verts
-      const lv = new Float32Array(9);
-      for (let j = 0; j < 9; j += 3) { lv[j]=v[j]-cx; lv[j+1]=v[j+1]-cy; lv[j+2]=v[j+2]-cz; }
-      const fg = new THREE.BufferGeometry();
-      fg.setAttribute('position', new THREE.BufferAttribute(lv, 3));
-      const mat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, wireframe: true, side: THREE.DoubleSide });
-      const fm = new THREE.Mesh(fg, mat);
-      fm.position.set(cx, cy, cz);
-      mode0.add(fm);
-      faces.push({ m: fm, mat, cx, cy, cz, d, nx: cx/d, ny: cy/d, nz: cz/d, rx: Math.random()*2-1, ry: Math.random()*2-1 });
-    }
-    scene.add(mode0);
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 25, 60);
+    camera.lookAt(0, 5, 0);
 
-    /* ── MODE 1: RINGS ── */
-    const mode1 = new THREE.Group();
-    const rings = [];
-    for (let i = 0; i < 8; i++) {
-      const c = new THREE.Color(0xff0d64).lerp(new THREE.Color(0x00e5ff), i / 8);
-      const m = new THREE.Mesh(
-        new THREE.TorusGeometry(30 + i * 15, 0.4, 6, 80),
-        new THREE.MeshBasicMaterial({ color: c, wireframe: true })
-      );
-      m.rotation.x = Math.PI / 2 + (i - 4) * 0.15;
-      mode1.add(m);
-      rings.push(m);
-    }
-    mode1.visible = false;
-    scene.add(mode1);
+    // subtle ambient light
+    scene.add(new THREE.AmbientLight(0x222244, 0.5));
+    // directional for form
+    const dirLight = new THREE.DirectionalLight(0x4466aa, 0.8);
+    dirLight.position.set(10, 30, 20);
+    scene.add(dirLight);
 
-    /* ── MODE 2: GRID TERRAIN ── */
-    const mode2 = new THREE.Group();
-    const gridGeo = new THREE.PlaneGeometry(400, 400, 60, 60);
-    gridGeo.rotateX(-Math.PI / 2);
-    const gridBase = Float32Array.from(gridGeo.attributes.position.array);
-    mode2.add(new THREE.Mesh(gridGeo, new THREE.MeshBasicMaterial({ color: 0x1a33ff, wireframe: true })));
-    mode2.visible = false;
-    scene.add(mode2);
-
-    /* ── MODE 3: RIBBONS ── */
-    const mode3 = new THREE.Group();
-    const ribbonGeos = [];
-    for (let r = 0; r < 6; r++) {
-      const arr = new Float32Array(150 * 3);
-      // initialize with a visible line so it doesn't start degenerate
-      for (let p = 0; p < 150; p++) {
-        arr[p * 3] = (p / 150 - 0.5) * 300;
-        arr[p * 3 + 1] = Math.sin(p * 0.1 + r) * 20;
-        arr[p * 3 + 2] = Math.cos(p * 0.08 + r) * 15;
-      }
-      const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
-      const c = new THREE.Color(0x8800ff).lerp(new THREE.Color(0x00e5ff), r / 6);
-      mode3.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: c })));
-      ribbonGeos.push({ geo: g, off: r * 1.5 });
-    }
-    mode3.visible = false;
-    scene.add(mode3);
-
-    /* ── mode management ── */
-    const MODES = [mode0, mode1, mode2, mode3];
-    const NAMES = ['wireframe', 'rings', 'terrain', 'ribbons'];
-    let curMode = 0;
-    document.getElementById('mode-label').textContent = NAMES[0];
-
-    renderer.domElement.addEventListener('click', () => {
-      if (!audioReady) return;
-      MODES[curMode].visible = false;
-      curMode = (curMode + 1) % MODES.length;
-      MODES[curMode].visible = true;
-      document.getElementById('mode-label').textContent = NAMES[curMode];
-    });
-
-    /* ── audio ── */
+    // ══════════════════════════════════════════════
+    // AUDIO
+    // ══════════════════════════════════════════════
     let audioCtx, analyser, freqData, audioReady = false, sourceConnected = false;
     const audioEl = new Audio();
 
@@ -148,8 +91,7 @@
         analyser.connect(audioCtx.destination);
         sourceConnected = true;
       }
-      audioEl.play();
-      audioReady = true;
+      audioEl.play(); audioReady = true;
       document.getElementById('ui').className = 'hidden';
       document.getElementById('controls').className = 'visible';
     }
@@ -164,7 +106,7 @@
       return count > 0 ? (sum / count) / 255 : 0;
     }
 
-    /* ── file handling ── */
+    // file handling
     document.getElementById('ui').addEventListener('click', () => document.getElementById('file-input').click());
     document.getElementById('file-input').addEventListener('change', (e) => { if (e.target.files[0]) initAudio(e.target.files[0]); });
     document.body.addEventListener('dragover', (e) => e.preventDefault());
@@ -180,98 +122,214 @@
       if (paused) { audioEl.pause(); document.getElementById('pause-btn').textContent = 'play'; }
       else { audioEl.play(); document.getElementById('pause-btn').textContent = 'pause'; }
     });
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' && audioReady) { e.preventDefault(); document.getElementById('pause-btn').click(); }
+    });
 
-    /* ── animate ── */
-    let time = 0, sBass = 0, sMid = 0, sHigh = 0;
-    let prevBass = 0, prevMid = 0, prevHigh = 0;
-    let bassAttack = 0, midAttack = 0, highAttack = 0; // spike detectors
-    let bassPunch = 0; // decaying punch for rhythmic hits
+    // ══════════════════════════════════════════════
+    // LOAD ROCK MODELS
+    // ══════════════════════════════════════════════
+    const loader = new GLTFLoader();
+    const rockCache = {}; // name → geometry
+
+    async function loadModel(name) {
+      return new Promise((resolve) => {
+        loader.load(`models/${name}.glb`, (gltf) => {
+          gltf.scene.traverse((child) => {
+            if (child.isMesh) {
+              rockCache[name] = child.geometry;
+              resolve(child.geometry);
+            }
+          });
+        }, undefined, () => resolve(null));
+      });
+    }
+
+    // ══════════════════════════════════════════════
+    // SCENE LAYOUT — orchestra sections
+    // ══════════════════════════════════════════════
+    // Sections clustered like a real orchestra, audience at +Z
+    // All rocks shatter, each within its own small area
+    const ROCK_LAYOUT = [
+      // ROW 4 (back, y=6) — PERCUSSION: boulders (bass) + WOODWINDS: pillars (highs)
+      { model: 'boulder_1', pos: [-8,  6, -8],  scale: 5, band: 'bass', spread: 1.5 },
+      { model: 'boulder_2', pos: [ 0,  6, -10], scale: 6, band: 'bass', spread: 1.8 },
+      { model: 'boulder_3', pos: [ 8,  6, -8],  scale: 5, band: 'bass', spread: 1.5 },
+      { model: 'pillar_1',  pos: [-22, 6, -5],  scale: 4, band: 'high', spread: 1 },
+      { model: 'pillar_2',  pos: [-28, 6, -3],  scale: 4, band: 'high', spread: 1 },
+      { model: 'pillar_3',  pos: [ 22, 6, -5],  scale: 4, band: 'high', spread: 1 },
+
+      // ROW 3 (y=4) — DOUBLE BASS: cubes (sub) + CELLOS: slabs (low mids)
+      { model: 'cube_1',  pos: [ 18, 4, -5], scale: 4, band: 'sub', spread: 1.2 },
+      { model: 'cube_2',  pos: [ 24, 4, -3], scale: 4, band: 'sub', spread: 1.2 },
+      { model: 'slab_1',  pos: [-18, 4, -5], scale: 5, band: 'lowmid', spread: 1.2 },
+      { model: 'slab_2',  pos: [-24, 4, -3], scale: 5, band: 'lowmid', spread: 1.2 },
+
+      // ROW 2 (y=2) — VIOLAS: orbs (mids) + VIOLINS: crystals (high mids)
+      { model: 'orb_1',     pos: [-12, 2, -2], scale: 3, band: 'mid', spread: 1 },
+      { model: 'orb_2',     pos: [-18, 2, 0],  scale: 3, band: 'mid', spread: 1 },
+      { model: 'crystal_1', pos: [ 10, 2, -2], scale: 4, band: 'highmid', spread: 1.2 },
+      { model: 'crystal_2', pos: [ 16, 2, 0],  scale: 4, band: 'highmid', spread: 1.2 },
+
+      // ROW 1 (front, y=0) — SMALL PERCUSSION: pebbles (hi-hats)
+      { model: 'pebble_1', pos: [-5, 0, 5],  scale: 3, band: 'hihat', spread: 0.8 },
+      { model: 'pebble_2', pos: [ 0, 0, 7],  scale: 2.5, band: 'hihat', spread: 0.8 },
+      { model: 'pebble_3', pos: [ 5, 0, 5],  scale: 3, band: 'hihat', spread: 0.8 },
+    ];
+
+    // frequency bands
+    const BANDS = {
+      sub:     [20, 60],
+      bass:    [60, 200],
+      lowmid:  [200, 600],
+      mid:     [600, 2000],
+      highmid: [2000, 6000],
+      high:    [6000, 12000],
+      hihat:   [8000, 16000],
+    };
+
+    // neon colors per band
+    const BAND_COLORS = {
+      sub:     new THREE.Color(0xff0040),
+      bass:    new THREE.Color(0xff0066),
+      lowmid:  new THREE.Color(0xaa00ff),
+      mid:     new THREE.Color(0x4400ff),
+      highmid: new THREE.Color(0x0066ff),
+      high:    new THREE.Color(0x00ccff),
+      hihat:   new THREE.Color(0x00ffcc),
+    };
+
+    const rocks = []; // { mesh, config, baseY, material }
+
+    async function buildScene() {
+      const loadEl = document.getElementById('loading');
+      const needed = [...new Set(ROCK_LAYOUT.map(r => r.model))];
+      let loaded = 0;
+      for (const name of needed) {
+        loadEl.textContent = `loading models... ${++loaded}/${needed.length}`;
+        await loadModel(name);
+      }
+      loadEl.textContent = '';
+
+      // stepped semicircular risers (like orchestra seating)
+      const riserMat = new THREE.MeshBasicMaterial({ color: 0x0a0a18, wireframe: true, transparent: true, opacity: 0.06 });
+      const STEPS = [
+        { radius: 15, height: 0, y: 0 },     // front — small percussion
+        { radius: 22, height: 2, y: 2 },     // second — violins/crystals
+        { radius: 30, height: 4, y: 4 },     // third — violas/cellos
+        { radius: 40, height: 6, y: 6 },     // back — percussion/bass/woodwinds
+      ];
+      for (const step of STEPS) {
+        // semicircular platform: half-cylinder
+        const geo = new THREE.CylinderGeometry(step.radius, step.radius, step.height || 0.5, 32, 1, false, 0, Math.PI);
+        const mesh = new THREE.Mesh(geo, riserMat.clone());
+        mesh.position.set(0, step.y / 2, 0);
+        mesh.rotation.y = Math.PI; // open toward camera
+        scene.add(mesh);
+        // flat top surface
+        const topGeo = new THREE.CircleGeometry(step.radius, 32, 0, Math.PI);
+        topGeo.rotateX(-Math.PI / 2);
+        const topMesh = new THREE.Mesh(topGeo, riserMat.clone());
+        topMesh.position.set(0, step.y, 0);
+        topMesh.rotation.y = Math.PI;
+        scene.add(topMesh);
+      }
+
+      // all rocks shatter — decompose each into individual faces
+      for (const config of ROCK_LAYOUT) {
+        const geo = rockCache[config.model];
+        if (!geo) continue;
+        const color = BAND_COLORS[config.band] || new THREE.Color(0x00e5ff);
+
+        const nonIdx = geo.index ? geo.toNonIndexed() : geo;
+        const arr = nonIdx.attributes.position.array;
+        const group = new THREE.Group();
+        group.position.set(config.pos[0], config.pos[1], config.pos[2]);
+        group.scale.setScalar(config.scale);
+        group.rotation.y = Math.random() * Math.PI * 2;
+
+        const faces = [];
+        for (let f = 0; f < arr.length; f += 9) {
+          const v = new Float32Array(arr.slice(f, f + 9));
+          const cx = (v[0]+v[3]+v[6])/3, cy = (v[1]+v[4]+v[7])/3, cz = (v[2]+v[5]+v[8])/3;
+          const d = Math.sqrt(cx*cx+cy*cy+cz*cz) || 1;
+          for (let j = 0; j < 9; j += 3) { v[j]-=cx; v[j+1]-=cy; v[j+2]-=cz; }
+          const fg = new THREE.BufferGeometry();
+          fg.setAttribute('position', new THREE.BufferAttribute(v, 3));
+          const fm = new THREE.Mesh(fg, new THREE.MeshBasicMaterial({
+            color: color.clone(), wireframe: true, transparent: true, opacity: 0.6, side: THREE.DoubleSide
+          }));
+          fm.position.set(cx, cy, cz);
+          group.add(fm);
+          faces.push({ m: fm, cx, cy, cz, d, nx: cx/d, ny: cy/d, nz: cz/d });
+        }
+
+        scene.add(group);
+        rocks.push({
+          mesh: group, config, faces,
+          baseY: config.pos[1], baseScale: config.scale,
+          seed: Math.random() * 100,
+          spread: config.spread || 3,
+        });
+      }
+    }
+
+    buildScene();
+
+    // ══════════════════════════════════════════════
+    // ANIMATE
+    // ══════════════════════════════════════════════
+    let time = 0;
+    const smoothEnergy = {};
+    const prevEnergy = {};
+    const attacks = {};
+    for (const band of Object.keys(BANDS)) {
+      smoothEnergy[band] = 0;
+      prevEnergy[band] = 0;
+      attacks[band] = 0;
+    }
 
     function animate() {
       requestAnimationFrame(animate);
       time += 0.016;
 
-      const bass = getEnergy(20, 150);
-      const mid = getEnergy(150, 2000);
-      const high = getEnergy(2000, 16000);
-      sBass += (bass - sBass) * 0.15;
-      sMid += (mid - sMid) * 0.12;
-      sHigh += (high - sHigh) * 0.1;
+      // update all band energies
+      for (const [band, [lo, hi]] of Object.entries(BANDS)) {
+        const raw = getEnergy(lo, hi);
+        smoothEnergy[band] += (raw - smoothEnergy[band]) * 0.15;
+        attacks[band] = Math.max(0, raw - prevEnergy[band]);
+        prevEnergy[band] = raw;
+      }
 
-      // attack detection: how much did energy JUMP this frame?
-      bassAttack = Math.max(0, bass - prevBass);
-      midAttack = Math.max(0, mid - prevMid);
-      highAttack = Math.max(0, high - prevHigh);
-      prevBass = bass; prevMid = mid; prevHigh = high;
+      // update each rock — all shatter within their spread area
+      for (const rock of rocks) {
+        const e = smoothEnergy[rock.config.band] || 0;
+        const atk = attacks[rock.config.band] || 0;
+        const punch = Math.max(0, atk * 4);
+        const spread = rock.spread;
+        const baseColor = BAND_COLORS[rock.config.band];
 
-      // bass punch: spikes on kick drums, decays fast
-      bassPunch = Math.max(bassPunch * 0.85, bassAttack * 4);
-
-      if (curMode === 0) {
-        // shatter: faces fly outward on bass punches, reassemble when quiet
-        const explode = bassPunch * 60;
-        // color shifts with mids: cyan → pink → purple
-        const hue = (sMid * 0.8 + time * 0.05) % 1;
-        const midColor = new THREE.Color().setHSL(hue * 0.3 + 0.5, 0.9, 0.5 + sBass * 0.2);
-
-        for (let i = 0; i < faces.length; i++) {
-          const f = faces[i];
-          // pure outward displacement — no rotation, no size change
-          // music breaks the sphere, silence reassembles it
+        // shatter: subtle outward movement, faces stay close
+        const explode = (punch * spread * 1.5) + (e * spread * 0.3);
+        for (const f of rock.faces) {
           f.m.position.set(
             f.cx + f.nx * explode,
             f.cy + f.ny * explode,
             f.cz + f.nz * explode
           );
-          f.mat.color.copy(midColor);
+          f.m.material.color.copy(baseColor).multiplyScalar(0.6 + e * 1.5);
+          f.m.material.opacity = 0.6 + e * 0.3;
         }
 
-        mode0.rotation.y = time * (0.15 + sBass * 0.2);
-        mode0.rotation.x = Math.sin(time * 0.12) * 0.2;
+        // gentle lift
+        rock.mesh.position.y = rock.baseY + e * 0.8 + punch * 0.5;
       }
 
-      if (curMode === 1) {
-        for (let i = 0; i < rings.length; i++) {
-          const band = i / 8;
-          const e = band < 0.35 ? sBass : band < 0.65 ? sMid : sHigh;
-          rings[i].scale.setScalar(1 + e * 0.4);
-          rings[i].rotation.z = time * (0.2 + i*0.08) * (i%2 ? 1 : -1);
-          rings[i].rotation.x = Math.PI/2 + (i-4)*0.15 + Math.sin(time*0.5+i)*e*0.3;
-        }
-      }
-
-      if (curMode === 2) {
-        const p = gridGeo.attributes.position.array;
-        for (let i = 0; i < p.length; i += 3) {
-          const x = gridBase[i], z = gridBase[i+2];
-          p[i+1] = Math.sin(x*0.02+time*1.5)*Math.cos(z*0.02+time)*sBass*40
-                  + Math.sin(x*0.08+time*4)*Math.sin(z*0.06-time*3)*sMid*15
-                  + Math.sin(x*0.3+z*0.3+time*10)*sHigh*5;
-        }
-        gridGeo.attributes.position.needsUpdate = true;
-      }
-
-      if (curMode === 3) {
-        for (let r = 0; r < ribbonGeos.length; r++) {
-          const rb = ribbonGeos[r];
-          const pos = rb.geo.attributes.position.array;
-          for (let p = 0; p < 150; p++) {
-            const s = p / 150;
-            pos[p*3] = (s - 0.5) * 300;
-            pos[p*3+1] = Math.sin(s*4+time*2+rb.off)*(20+sBass*40) + Math.sin(s*12+time*5+rb.off*2)*sMid*15;
-            pos[p*3+2] = Math.cos(s*3+time*1.5+rb.off)*(15+sMid*20) + Math.sin(s*8+time*6)*sHigh*10;
-          }
-          rb.geo.attributes.position.needsUpdate = true;
-        }
-      }
-
-      // camera
-      const camY = curMode === 2 ? 120 : 60;
-      const camZ = curMode === 2 ? 180 : 250;
-      camera.position.x += (Math.sin(time*0.1)*30 - camera.position.x) * 0.02;
-      camera.position.y += (camY + Math.sin(time*0.07)*15 - camera.position.y) * 0.02;
-      camera.position.z += (camZ + Math.cos(time*0.08)*20 - camera.position.z) * 0.02;
-      camera.lookAt(0, 0, 0);
+      // camera: zoomed out, full view of the stage
+      camera.position.x = Math.sin(time * 0.03) * 10;
+      camera.position.z = 70 + Math.cos(time * 0.025) * 5;
+      camera.position.y = 20 + Math.sin(time * 0.04) * 3;
+      camera.lookAt(0, 3, -5);
 
       renderer.render(scene, camera);
     }
